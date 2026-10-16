@@ -14,12 +14,11 @@ which belongs to Herdr once the plugin is installed.
 """
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 PLUGIN_ID = "estudio37.snip"
 ROOT = Path(__file__).resolve().parent.parent
-# Abstract unix socket (Linux): the sound player listens here, the picker sends to it.
-SOUND_SOCKET = "\0" + os.environ.get("SNIP_SOUND_SOCKET", "herdr-snip-sound")
 DEFAULTS = {"operator": "", "sound": "on", "volume": "1.0"}
 
 
@@ -54,8 +53,9 @@ def config_dir():
     return Path(base) / "herdr" / "plugins" / "config" / PLUGIN_ID
 
 
-def settings():
-    values = dict(DEFAULTS)
+def configured():
+    """Only what the config file sets, without the defaults."""
+    values = {}
     try:
         text = (config_dir() / "config").read_text(encoding="utf-8")
     except OSError:
@@ -65,6 +65,24 @@ def settings():
         if sep and key.strip() in DEFAULTS:
             values[key.strip()] = value.strip()
     return values
+
+
+def settings():
+    values = dict(DEFAULTS)
+    values.update(configured())
+    return values
+
+
+def sound_socket(platform=None):
+    """Where the sound player listens and the picker sends. Linux has abstract
+    unix sockets, which leave no file behind; macOS doesn't, so there it is a
+    socket file in the state folder. A SNIP_SOUND_SOCKET with a slash is a path."""
+    name = os.environ.get("SNIP_SOUND_SOCKET", "herdr-snip-sound")
+    if "/" in name:
+        return name
+    if (platform or sys.platform).startswith("linux"):
+        return "\0" + name
+    return str(state_dir() / (name + ".sock"))
 
 
 def sound_on(values):

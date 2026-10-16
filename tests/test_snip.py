@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import wave
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -116,6 +117,153 @@ class SoundTests(unittest.TestCase):
         self.assertEqual(len(snip_sound.to_pcm([0.0, 0.5, -1.0])), 6)
 
 
+STUB_AFPLAY = """#!/usr/bin/env python3
+import os, sys, time
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write("start %f %s\\n" % (time.time(), os.path.basename(sys.argv[1])))
+time.sleep(float(os.environ.get("STUB_SECONDS", "0.05")))
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write("end %f %s\\n" % (time.time(), os.path.basename(sys.argv[1])))
+"""
+
+
+class MacPlayerTests(unittest.TestCase):
+    """The macOS player (afplay) on any posix system, with a stub that logs each
+    call in place of afplay, and a socket file as on macOS."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        (self.tmp / "state").mkdir()
+        (self.tmp / "config").mkdir()
+        (self.tmp / "config" / "config").write_text("sound = on\n")
+        stub = self.tmp / "afplay"
+        stub.write_text(STUB_AFPLAY)
+        stub.chmod(0o755)
+        self.log = self.tmp / "afplay.log"
+        self.sock = str(self.tmp / "sound.sock")
+        self.env = dict(os.environ, SNIP_SOUND_BACKEND="afplay", SNIP_AFPLAY=str(stub), STUB_LOG=str(self.log),
+                        SNIP_STATE_DIR=str(self.tmp / "state"), SNIP_CONFIG_DIR=str(self.tmp / "config"),
+                        SNIP_SOUND_SOCKET=self.sock, SNIP_SOUND_IDLE="3")
+        self.addCleanup(self.stop)
+
+    def play(self, name, **env):
+        subprocess.run([sys.executable, "-I", str(ROOT / "bin" / "snip-sound"), "play", name],
+                       env=dict(self.env, **env), timeout=10, check=True)
+
+    def send(self, name):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.sendto(name.encode(), self.sock)
+        finally:
+            s.close()
+
+    def stop(self):
+        try:
+            self.send("quit")
+        except OSError:
+            pass
+
+    def wait_for_player(self, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end and not os.path.exists(self.sock):
+            time.sleep(0.02)
+        self.assertTrue(os.path.exists(self.sock), "player never started")
+
+    def calls(self, settle=0.6):
+        time.sleep(settle)
+        if not self.log.exists():
+            return []
+        return [line.split() for line in self.log.read_text().splitlines()]
+
+    def started(self, settle=0.6):
+        return [c[2] for c in self.calls(settle) if c[0] == "start"]
+
+    def test_each_sound_plays_its_own_wav(self):
+        self.play("hit")
+        self.wait_for_player()
+        for name in ("lock", "sent"):
+            time.sleep(0.15)
+            self.send(name)
+        self.assertEqual(self.started(), ["hit.wav", "lock.wav", "sent.wav"])
+        with wave.open(str(self.tmp / "state" / "sounds" / "hit.wav")) as w:
+            self.assertEqual((w.getframerate(), w.getsampwidth(), w.getnchannels()), (snip_sound.RATE, 2, 1))
+
+    def test_fast_taps_are_spaced_out(self):
+        self.play("freeze")
+        self.wait_for_player()
+        time.sleep(0.3)
+        for i in range(20):                         # 20 taps in one second
+            self.send("type%d" % (i % 3 + 1))
+            time.sleep(0.05)
+        taps = [s for s in self.started() if s.startswith("type")]
+        self.assertLessEqual(len(taps), 13)
+        self.assertGreaterEqual(len(taps), 5)
+
+    def test_never_more_than_four_at_once(self):
+        self.env["STUB_SECONDS"] = "0.8"
+        self.play("hit")
+        self.wait_for_player()
+        for name in ("lock", "sent", "select", "continue", "back", "error", "freeze"):
+            self.send(name)
+        events = sorted((float(t), kind) for kind, t, _ in self.calls(1.5))
+        playing = most = 0
+        for _, kind in events:
+            playing += 1 if kind == "start" else -1
+            most = max(most, playing)
+        self.assertEqual(most, 4)
+
+    def test_quits_when_idle_and_removes_its_socket(self):
+        self.play("hit", SNIP_SOUND_IDLE="0.6")
+        self.wait_for_player()
+        time.sleep(1.5)
+        self.assertFalse(os.path.exists(self.sock))
+
+    def test_a_stale_socket_file_is_replaced(self):
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        dead.bind(self.sock)
+        dead.close()                                # the file stays, nobody listens
+        self.play("hit")
+        self.assertEqual(self.started(1.0), ["hit.wav"])
+
+    def test_no_player_no_socket(self):
+        start = time.time()
+        self.play("hit", SNIP_SOUND_BACKEND="none")
+        self.assertLess(time.time() - start, 2)
+        self.assertEqual(self.started(0.5), [])
+        self.assertFalse(os.path.exists(self.sock))
+
+
+class SoundSocketTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {k: os.environ.get(k) for k in ("SNIP_SOUND_SOCKET", "SNIP_STATE_DIR", "SNIP_CONFIG_DIR",
+                                                      "SSH_CONNECTION")}
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        for k in self.saved:
+            os.environ.pop(k, None)
+        os.environ["SNIP_STATE_DIR"] = self.tmp
+        os.environ["SNIP_CONFIG_DIR"] = self.tmp
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_abstract_on_linux_a_file_on_macos(self):
+        self.assertEqual(cfg.sound_socket("linux"), "\0herdr-snip-sound")
+        self.assertEqual(cfg.sound_socket("darwin"), str(Path(self.tmp) / "herdr-snip-sound.sock"))
+
+    def test_ssh_keeps_the_mac_quiet_unless_asked(self):
+        self.assertEqual(snip_sound.afplay_allowed(), "afplay")
+        os.environ["SSH_CONNECTION"] = "10.0.0.2 51000 10.0.0.1 22"
+        self.assertIsNone(snip_sound.afplay_allowed())
+        Path(self.tmp, "config").write_text("sound = on\n")
+        self.assertEqual(snip_sound.afplay_allowed(), "afplay")
+
+
 class SettingsTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -151,7 +299,7 @@ class SettingsTests(unittest.TestCase):
 class Picker:
     """The real picker in a pseudo-terminal, fed from the fixtures."""
 
-    def __init__(self, rows=30, cols=100, layout=False, last_target=None, fail=False):
+    def __init__(self, rows=30, cols=100, layout=False, last_target=None, fail=False, listen=True):
         import pty  # posix only
         self.tmp = Path(tempfile.mkdtemp())
         self.state, config = self.tmp / "state", self.tmp / "config"
@@ -166,11 +314,12 @@ class Picker:
             (self.state / "last-target").write_text(last_target + "\n")
         (config / "config").write_text("operator = Ada\nsound = on\n")
         self.log = self.tmp / "herdr.log"
-        name = "herdr-snip-test-" + uuid.uuid4().hex
+        # an abstract socket on Linux, a socket file elsewhere, as cfg.sound_socket() picks
+        name = "herdr-snip-test-" + uuid.uuid4().hex if HAS_ABSTRACT_SOCKETS else str(self.tmp / "sound.sock")
         self.listener = None
-        if HAS_ABSTRACT_SOCKETS:
+        if listen:
             self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self.listener.bind("\0" + name)
+            self.listener.bind("\0" + name if HAS_ABSTRACT_SOCKETS else name)
             self.listener.setblocking(False)
         env = dict(os.environ, HERDR_BIN_PATH=str(FAKE_HERDR), FAKE_HERDR_LOG=str(self.log),
                    SNIP_STATE_DIR=str(self.state), SNIP_CONFIG_DIR=str(config), SNIP_SOUND_SOCKET=name)
@@ -271,12 +420,24 @@ class PickerTests(unittest.TestCase):
             "```",
         ]))
         self.assertEqual((p.state / "last-target").read_text().strip(), "orchestrator")
-        if HAS_ABSTRACT_SOCKETS:
-            heard = p.sounds()
-            self.assertEqual(heard[:3], ["hit", "lock", "continue"])
-            self.assertIn("type1", heard)
-            self.assertIn("select", heard)
-            self.assertEqual(heard[-1], "sent")
+        heard = p.sounds()
+        self.assertEqual(heard[:3], ["hit", "lock", "continue"])
+        self.assertIn("type1", heard)
+        self.assertIn("select", heard)
+        self.assertEqual(heard[-1], "sent")
+
+    def test_runs_the_same_with_no_sound_player(self):
+        p = self.picker(listen=False)              # sound on, nobody listening
+        start = time.time()
+        p.click(3, 13)
+        p.click(20, 13)
+        p.send("\r")
+        p.send("why?")
+        p.send("\r", 0.5)
+        p.send("\r")
+        result = p.finish()
+        self.assertEqual(result["outcome"], "sent")
+        self.assertLess(time.time() - start, 5)
 
     def test_last_agent_is_preselected(self):
         p = self.picker(last_target="tess")
@@ -300,8 +461,7 @@ class PickerTests(unittest.TestCase):
         result = p.finish()
         self.assertEqual(result["outcome"], "cancelled")
         self.assertEqual(p.prompts(), [])
-        if HAS_ABSTRACT_SOCKETS:
-            self.assertEqual(p.sounds()[-2:], ["back", "freeze"])
+        self.assertEqual(p.sounds()[-2:], ["back", "freeze"])
 
     def test_failed_send_is_reported(self):
         p = self.picker(fail=True)

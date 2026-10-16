@@ -16,16 +16,20 @@ open stream also keeps Bluetooth headsets awake, so short sounds aren't clipped.
 While the stream is open Windows won't idle-sleep, so the player quits after
 IDLE seconds without a request.
 
-Sound needs WSL: Windows audio is reached through Windows PowerShell, since a
-Linux audio server is often missing there. Anywhere PowerShell isn't found, this
-does nothing and the plugin runs silent. Requests travel as datagrams on an
-abstract unix socket, so senders never wait.
+On WSL, Windows audio is reached through Windows PowerShell, since a Linux audio
+server is often missing there. On macOS each sound is written once as a WAV file
+and played by afplay, which ships with macOS (see serve_afplay). Anywhere else
+this does nothing and the plugin runs silent. Requests travel as datagrams on a
+unix socket (abstract on Linux, a file in the state folder on macOS), so senders
+never wait.
 """
 import base64
 import os
 import socket
 import subprocess
 import sys
+import time
+import wave
 from array import array
 from pathlib import Path
 
@@ -276,10 +280,37 @@ def to_pcm(samples):
 
 # ---- player -----------------------------------------------------------------
 
+AFPLAY = os.environ.get("SNIP_AFPLAY", "/usr/bin/afplay")
+AFPLAY_MAX = 4                     # afplay processes playing at once
+GAP = 0.08                         # seconds between two ticks or taps of the same kind
+THROTTLED = {"move": "move", "type1": "type", "type2": "type", "type3": "type", "erase": "type"}
+
+
+def backend():
+    """Which player to run: Windows PowerShell on WSL, afplay on macOS, else none.
+    SNIP_SOUND_BACKEND (powershell, afplay or none) overrides, for tests."""
+    forced = os.environ.get("SNIP_SOUND_BACKEND")
+    if forced:
+        return None if forced == "none" else forced
+    if os.path.exists(POWERSHELL):
+        return "powershell"
+    if sys.platform == "darwin" and os.path.exists(AFPLAY):
+        return afplay_allowed()
+    return None
+
+
+def afplay_allowed():
+    """Over SSH the sound would play on this Mac, not where the user sits, so it
+    stays off there unless the config file asks for it."""
+    if os.environ.get("SSH_CONNECTION") and "sound" not in cfg.configured():
+        return None
+    return "afplay"
+
+
 def send(name):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
-        s.sendto(name.encode(), cfg.SOUND_SOCKET)
+        s.sendto(name.encode(), cfg.sound_socket())
         return True
     except OSError:
         return False
@@ -287,32 +318,68 @@ def send(name):
         s.close()
 
 
-def serve(first):
+def listen():
+    """Bind the player's socket, or None if a player already holds it. A socket
+    file left by a player that crashed refuses connections, so it is replaced."""
+    address = cfg.sound_socket()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
-        sock.bind(cfg.SOUND_SOCKET)
+        sock.bind(address)
+        return sock
     except OSError:
-        return  # already running
-    script = base64.b64encode(PLAYER.encode("utf-16-le")).decode()
+        if address.startswith("\0"):
+            sock.close()
+            return None
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        probe.connect(address)
+        sock.close()
+        return None  # a live player
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    try:
+        os.unlink(address)
+        sock.bind(address)
+        return sock
+    except OSError:
+        sock.close()
+        return None
+
+
+def requests(sock, first):
+    """Sound names as they arrive, ending after IDLE quiet seconds or on quit."""
+    if first:
+        yield first
+    sock.settimeout(float(os.environ.get("SNIP_SOUND_IDLE", IDLE)))
+    while True:
+        try:
+            name = sock.recv(64).decode(errors="ignore").strip()
+        except socket.timeout:
+            return
+        if name == "quit":
+            return
+        if name:
+            yield name
+
+
+def gains():
     master = cfg.volume(cfg.settings())
+    return {name: VOLUME_BY_SOUND.get(name, VOLUME) * master for name in sounds()}
+
+
+def serve_powershell(sock, first):
+    script = base64.b64encode(PLAYER.encode("utf-16-le")).decode()
     with open(cfg.state_dir() / "sound.log", "ab") as log:
         ps = subprocess.Popen([POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
                               stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
     try:
+        level = gains()
         for name, samples in sounds().items():
-            gain = VOLUME_BY_SOUND.get(name, VOLUME) * master
-            ps.stdin.write("load %s %s\n" % (name, base64.b64encode(to_pcm([s * gain for s in samples])).decode()))
-        if first:
-            ps.stdin.write("play %s\n" % first)
+            ps.stdin.write("load %s %s\n" % (name, base64.b64encode(to_pcm([s * level[name] for s in samples])).decode()))
         ps.stdin.flush()
-        sock.settimeout(IDLE)
-        while True:
-            try:
-                name = sock.recv(64).decode(errors="ignore").strip()
-            except socket.timeout:
-                break
-            if name == "quit":
-                break
+        for name in requests(sock, first):
             ps.stdin.write("play %s\n" % name)
             ps.stdin.flush()
     except (BrokenPipeError, OSError):
@@ -324,13 +391,64 @@ def serve(first):
             ps.wait(timeout=3)
         except Exception:
             ps.kill()
+
+
+def serve_afplay(sock, first):
+    """macOS: each sound is a WAV file played by its own afplay process. Starting
+    a process takes longer than the gap between fast keystrokes, so ticks and taps
+    of one kind are spaced GAP apart, and at most AFPLAY_MAX play at once."""
+    folder = cfg.state_dir() / "sounds"
+    folder.mkdir(exist_ok=True)
+    level = gains()
+    for name, samples in sounds().items():
+        with wave.open(str(folder / (name + ".wav")), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(to_pcm([s * level[name] for s in samples]))
+    playing, last = [], {}
+    with open(cfg.state_dir() / "sound.log", "ab") as log:
+        for name in requests(sock, first):
+            path = folder / (name + ".wav")
+            if not path.exists():
+                continue
+            now = time.monotonic()
+            kind = THROTTLED.get(name)
+            if kind and now - last.get(kind, -1.0) < GAP:
+                continue
+            playing = [p for p in playing if p.poll() is None]
+            if len(playing) >= AFPLAY_MAX:
+                continue
+            if kind:
+                last[kind] = now
+            try:
+                playing.append(subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
+                                                stdout=subprocess.DEVNULL, stderr=log))
+            except OSError:
+                return
+
+
+def serve(first):
+    kind = backend()
+    sock = listen() if kind else None
+    if not sock:
+        return
+    address = sock.getsockname()
+    try:
+        (serve_powershell if kind == "powershell" else serve_afplay)(sock, first)
+    finally:
         sock.close()
+        if isinstance(address, str) and address and not address.startswith("\0"):
+            try:
+                os.unlink(address)
+            except OSError:
+                pass
 
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "play" and len(sys.argv) > 2:
-        if not send(sys.argv[2]) and os.path.exists(POWERSHELL):
+        if not send(sys.argv[2]) and backend():
             subprocess.Popen([sys.executable, "-I", __file__, "serve", sys.argv[2]], start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elif cmd == "serve":

@@ -394,6 +394,7 @@ class Snip:
         self.keys_typed = 0
         self.last_tick = 0.0
         self.speaker = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) if cfg.sound_on(settings) else None
+        self.sound_to = cfg.sound_socket() if self.speaker else None
         self.resized = False
         self.dirty = True
         self.started = time.time()
@@ -428,7 +429,7 @@ class Snip:
         """Ask bin/snip-sound's player for a sound. Fire and forget: no player, no sound."""
         if self.speaker:
             try:
-                self.speaker.sendto(name.encode(), cfg.SOUND_SOCKET)
+                self.speaker.sendto(name.encode(), self.sound_to)
             except OSError:
                 pass
 
