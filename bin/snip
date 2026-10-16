@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+"""snip: box part of a frozen pane with two clicks and ask an agent about it.
+
+Runs as the plugin's overlay pane. bin/snip-open has already saved the pane's
+screen as an ANSI snapshot; this draws it frozen in cold steel tones, lined up
+cell for cell with the live screen beneath. The user clicks two opposite
+corners and the area between them thaws back to its real colors, live while the
+mouse moves. Each click throws a hit spark drawn in braille dots and leaves
+amber brackets just outside the box, so no character inside it is covered.
+
+Enter opens a card for the question; Continue swaps it for a card listing the
+agents in this Herdr server; Send hands the chosen agent the question, where the
+box came from, and the box text, via `herdr agent prompt`. Esc steps back one
+card at a time, then closes. The outcome is written to result.json in the state
+folder (see lib/snip_settings.py).
+"""
+import codecs
+import json
+import math
+import os
+import re
+import select
+import signal
+import socket
+import sys
+import termios
+import time
+import traceback
+import tty
+import unicodedata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import snip_settings as cfg  # noqa: E402
+
+# ---- look -------------------------------------------------------------------
+
+# the frozen screen: cold, with three tones so headings keep their weight
+FROST_BG = (16, 24, 38)
+FROST_BG_SET = (24, 34, 51)
+GUIDE_BG = (28, 43, 66)
+FROST_FG = {"dim": (60, 72, 90), "mid": (98, 114, 135), "bright": (150, 166, 186)}
+# amber marks what you act on: corners, the size label, the field, the buttons
+AMBER = (255, 181, 71)
+AMBER_MID = (186, 134, 60)
+AMBER_LOW = (112, 84, 46)
+AMBER_HOVER = (255, 206, 130)
+AMBER_INK = (110, 76, 26)
+INK = (16, 24, 38)
+BAR_BG = (27, 39, 58)
+BAR_FG = (201, 214, 227)
+BAR_DIM = (120, 138, 160)
+# the cards: the screen sinks, the box stays lit
+BACKDROP_FG = (46, 56, 72)
+BACKDROP_BG = (11, 17, 27)
+CARD_BG = (27, 39, 58)
+CARD_EDGE = (88, 106, 130)
+FIELD_BG = (13, 20, 32)
+FIELD_FG = (236, 241, 246)
+BUTTON_BG = (44, 61, 88)
+BUTTON_HOVER = (62, 84, 118)
+FAIL = (235, 112, 100)
+DISABLED = (78, 92, 112)
+STATUS = {"idle": (110, 200, 140), "done": (110, 200, 140), "working": (120, 165, 230),
+          "blocked": FAIL, "unknown": BAR_DIM}
+MAX_LIST = 10       # agents shown at once; the list scrolls past that
+IDLE_CLOSE = 900    # seconds without input before the overlay closes itself
+
+# ---- hit spark --------------------------------------------------------------
+# A white-hot core and a + of two streaks, one long and one short, which break
+# off, fly outward and cool to amber, while a thin unfilled ring races ahead of
+# them and fades. Drawn in braille: a cell holds 2 x 4 dots and the dots are
+# evenly spaced, so lines keep their true angles. Units below are dots.
+
+SPARK_FRAME = 0.065
+SPARK_STEPS = 7
+WHITE_HOT = (255, 250, 238)
+PALE = (255, 226, 170)
+EMBER = (72, 58, 38)
+LONG = 0.0                  # horizontal arm
+SHORT = -math.pi / 2        # vertical arm
+SPARK_CORE = {0: WHITE_HOT, 1: PALE}    # frame -> the clicked cell flashes solid
+# frame -> (radius, color): the ring outruns the arms and cools as it goes
+RING = {1: (7, PALE), 2: (12, AMBER), 3: (16, AMBER_MID), 4: (19, AMBER_LOW),
+        5: (21, EMBER), 6: (22, (50, 42, 32))}
+BRAILLE = {(0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+           (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80}
+
+# alternate screen, hidden cursor, mouse buttons + motion in SGR encoding
+ENTER = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+LEAVE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[0 q\x1b[?25h\x1b[?1049l"
+
+BASIC = [(0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16),
+         (36, 114, 200), (188, 63, 188), (17, 168, 205), (229, 229, 229)]
+EMOJI_PRESENTATION = "️"
+
+
+def ray(angle, a, b):
+    n = max(1, int((b - a) * 2))
+    return [((a + (b - a) * i / n) * math.cos(angle), (a + (b - a) * i / n) * math.sin(angle))
+            for i in range(n + 1)]
+
+
+def streak(angle, a, b):
+    """Both halves of a line through the core, from distance a to b."""
+    return ray(angle, a, b) + ray(angle + math.pi, a, b)
+
+
+def ring(r):
+    """An outline circle, one dot per dot of circumference; never filled."""
+    n = max(8, int(2 * math.pi * r))
+    return [(r * math.cos(2 * math.pi * i / n), r * math.sin(2 * math.pi * i / n)) for i in range(n)]
+
+
+def spark_layers(k):
+    layers = {
+        0: [(streak(LONG, 2, 7), WHITE_HOT), (streak(SHORT, 2, 3), PALE)],
+        1: [(streak(LONG, 2, 11), WHITE_HOT), (streak(SHORT, 2, 6), PALE)],
+        2: [(streak(SHORT, 0, 9), WHITE_HOT), (streak(LONG, 4, 12), PALE)],
+        3: [(streak(LONG, 8, 13), AMBER), (streak(SHORT, 4, 11), PALE)],
+        4: [(streak(LONG, 12, 14), AMBER), (streak(SHORT, 9, 13), AMBER)],
+        5: [(streak(LONG, 15, 15) + streak(SHORT, 15, 15), AMBER_MID)],
+        6: [(streak(LONG, 16, 16), AMBER_LOW)],
+    }.get(k, [])
+    if k in RING:
+        radius, color = RING[k]
+        layers.append((ring(radius), color))
+    return layers
+
+
+_spark_cache = {}
+
+
+def spark_cells(k):
+    """Frame k of the spark as {(row offset, col offset): (braille bits, color)}.
+    Where layers overlap a cell, the brightest color wins."""
+    if k not in _spark_cache:
+        cells = {}
+        for points, color in spark_layers(k):
+            for px, py in points:
+                x, y = round(1 + px), round(2 + py)
+                key = (y // 4, x // 2)
+                bits, old = cells.get(key, (0, None))
+                bright = old if old and sum(old) >= sum(color) else color
+                cells[key] = (bits | BRAILLE[(x % 2, y % 4)], bright)
+        _spark_cache[k] = cells
+    return _spark_cache[k]
+
+
+def fg(c):
+    return "38;2;%d;%d;%d" % c
+
+
+def bg(c):
+    return "48;2;%d;%d;%d" % c
+
+
+# ---- snapshot parsing -------------------------------------------------------
+
+def cell_width(ch):
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def apply_sgr(st, params):
+    """Apply one SGR sequence's parameters to a style state."""
+    nums = [int(p) if p.isdigit() else 0 for p in (params.replace(":", ";").split(";") if params else ["0"])]
+    k = 0
+    while k < len(nums):
+        n = nums[k]
+        if n == 0:
+            st["fg"] = st["bg"] = None
+            st["attrs"] = set()
+        elif n in (1, 2, 3, 4, 5, 7, 8, 9):
+            st["attrs"].add(n)
+        elif n == 22:
+            st["attrs"] -= {1, 2}
+        elif n in (23, 24, 25, 27, 28, 29):
+            st["attrs"].discard(n - 20)
+        elif 30 <= n <= 37 or 90 <= n <= 97:
+            st["fg"] = ("b", n)
+        elif n == 39:
+            st["fg"] = None
+        elif 40 <= n <= 47 or 100 <= n <= 107:
+            st["bg"] = ("b", n)
+        elif n == 49:
+            st["bg"] = None
+        elif n in (38, 48, 58):
+            val = None
+            if k + 2 < len(nums) and nums[k + 1] == 5:
+                val, k = ("i", nums[k + 2]), k + 2
+            elif k + 4 < len(nums) and nums[k + 1] == 2:
+                val, k = ("r", nums[k + 2], nums[k + 3], nums[k + 4]), k + 4
+            if n == 38:
+                st["fg"] = val
+            elif n == 48:
+                st["bg"] = val
+        k += 1
+
+
+def parse_snapshot(raw):
+    """Turn the ANSI snapshot into rows of cells: {ch, w, st}. A wide glyph takes
+    two cells; the second has w=0 and no text."""
+    st = {"fg": None, "bg": None, "attrs": set()}
+    grid = []
+    for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        row, lead, i = [], None, 0
+        while i < len(line):
+            ch = line[i]
+            if ch == "\x1b":
+                nxt = line[i + 1] if i + 1 < len(line) else ""
+                if nxt == "[":
+                    j = i + 2
+                    while j < len(line) and not ("@" <= line[j] <= "~"):
+                        j += 1
+                    if j < len(line) and line[j] == "m":
+                        apply_sgr(st, line[i + 2:j])
+                    i = j + 1
+                elif nxt == "]":
+                    j = i + 2
+                    while j < len(line) and line[j] != "\x07" and line[j:j + 2] != "\x1b\\":
+                        j += 1
+                    i = j + (2 if line[j:j + 2] == "\x1b\\" else 1)
+                else:
+                    i += 2
+                continue
+            i += 1
+            style = (st["fg"], st["bg"], frozenset(st["attrs"]))
+            if ch == "\t":
+                for _ in range(8 - len(row) % 8):
+                    row.append({"ch": " ", "w": 1, "st": style})
+                lead = None
+                continue
+            if ch == EMOJI_PRESENTATION and lead is not None and row[lead]["w"] == 1:
+                # the glyph before it is drawn as an emoji, two cells wide
+                row[lead]["ch"] += ch
+                row[lead]["w"] = 2
+                row.insert(lead + 1, {"ch": "", "w": 0, "st": row[lead]["st"]})
+                continue
+            if ord(ch) < 32 or ord(ch) == 127:
+                continue
+            w = cell_width(ch)
+            if w == 0:
+                if lead is not None:
+                    row[lead]["ch"] += ch
+                continue
+            lead = len(row)
+            row.append({"ch": ch, "w": w, "st": style})
+            if w == 2:
+                row.append({"ch": "", "w": 0, "st": style})
+        grid.append(row)
+    return grid
+
+
+def row_text(row, c1=0, c2=None):
+    """The text of cells c1..c2 of a row, trailing spaces dropped. A wide glyph
+    cut in half at the left edge becomes a space."""
+    c2 = len(row) - 1 if c2 is None else c2
+    s = ""
+    for c in range(c1, c2 + 1):
+        if c >= len(row):
+            s += " "
+        elif row[c]["w"] == 0:
+            s += " " if c == c1 else ""
+        else:
+            s += row[c]["ch"]
+    return s.rstrip()
+
+
+def read_text(path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def fit(s, n):
+    """Pad or cut s to exactly n cells."""
+    if n <= 0:
+        return ""
+    return s.ljust(n) if len(s) <= n else s[:n - 1] + "…"
+
+
+def wrap(text, width):
+    """Greedy word wrap. A space that would end a line moves to the next one, so
+    the cursor drawn at the end of the last line is where the next key lands."""
+    lines, cur = [], ""
+    for token in re.findall(r"\S+|\s", text):
+        if token.isspace():
+            if len(cur) + 1 > width:
+                lines.append(cur)
+                cur = ""
+            else:
+                cur += " "
+            continue
+        while len(token) > width:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(token[:width])
+            token = token[width:]
+        if len(cur) + len(token) > width:
+            lines.append(cur.rstrip())
+            cur = ""
+        cur += token
+    lines.append(cur)
+    return lines
+
+
+# ---- color ------------------------------------------------------------------
+
+def color_code(val, base):
+    if val[0] == "b":
+        return str(val[1])
+    if val[0] == "i":
+        return "%d;5;%d" % (base, val[1])
+    return "%d;2;%d;%d;%d" % (base, val[1], val[2], val[3])
+
+
+def true_sgr(style):
+    f, b, attrs = style
+    parts = [str(a) for a in sorted(attrs)]
+    if f:
+        parts.append(color_code(f, 38))
+    if b:
+        parts.append(color_code(b, 48))
+    return ";".join(parts)
+
+
+def to_rgb(val):
+    if val is None:
+        return None
+    if val[0] == "r":
+        return val[1:]
+    n = val[1]
+    if val[0] == "b":
+        base = BASIC[(n - 90) if n >= 90 else (n - 30)]
+        return tuple(min(255, v + 40) for v in base) if n >= 90 else base
+    if n < 16:
+        base = BASIC[n % 8]
+        return tuple(min(255, v + 40) for v in base) if n >= 8 else base
+    if n < 232:
+        n -= 16
+        steps = (0, 95, 135, 175, 215, 255)
+        return steps[n // 36], steps[(n // 6) % 6], steps[n % 6]
+    g = 8 + (n - 232) * 10
+    return g, g, g
+
+
+def frost_tone(style):
+    """Map a cell's real brightness onto three frozen tones, so headings and
+    secondary text keep their weight on the frozen screen."""
+    f, _, attrs = style
+    if 2 in attrs:
+        return "dim"
+    rgb = to_rgb(f)
+    lum = 0.86 if rgb is None else (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255
+    if 1 in attrs or lum >= 0.8:
+        return "bright"
+    return "mid" if lum >= 0.45 else "dim"
+
+
+# ---- the picker -------------------------------------------------------------
+
+class Snip:
+    """States: first -> second -> locked -> ask -> pick -> sending -> done,
+    or cancelled from any of the first five. Coordinates are pane cells
+    throughout; self.off converts to and from the overlay's own cells."""
+
+    def __init__(self, grid, state_dir, settings):
+        self.grid = grid
+        self.dir = state_dir
+        self.operator = settings["operator"]
+        self.size = os.get_terminal_size(1)
+        self.state = "first"
+        self.a = self.b = None
+        self.mouse = None
+        self.sparks = []
+        self.counts = {"press": 0, "release": 0, "motion": 0, "wheel": 0}
+        self.clicks = []
+        self.outcome = None
+        self.final_box = None
+        self.question = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        self.flash = ""
+        self.send_log = None
+        self.buttons = {}
+        self.button_row = None
+        self.cursor = None
+        self.agents, self.agents_error = [], None
+        self.pick, self.scroll, self.list_rows = None, 0, {}
+        self.source = read_text(state_dir / "source-pane")
+        self.keys_typed = 0
+        self.last_tick = 0.0
+        self.speaker = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) if cfg.sound_on(settings) else None
+        self.resized = False
+        self.dirty = True
+        self.started = time.time()
+        self.last_input = time.time()
+        self.off, self.pane_size = self.geometry()
+
+    def geometry(self):
+        """Line the frozen copy up with the live screen. Returns the (rows, cols) to add
+        to an overlay cell to get the pane cell beneath it, and the pane's size.
+        Herdr draws an overlay inside a one-cell frame, over the whole tab or over
+        the pane; whichever matches the overlay's size says where it sits."""
+        rows, cols = self.size.lines, self.size.columns
+        fallback = (len(self.grid), max((len(r) for r in self.grid), default=cols))
+        try:
+            lay = json.loads((self.dir / "source-layout.json").read_text(encoding="utf-8"))["result"]["layout"]
+            pane = next(p["rect"] for p in lay["panes"] if p["pane_id"] == self.source)
+        except (OSError, ValueError, KeyError, StopIteration):
+            return (0, 0), fallback
+        for frame in (lay["area"], pane):
+            if abs(frame["width"] - 2 - cols) <= 1 and abs(frame["height"] - 2 - rows) <= 1:
+                return (frame["y"] + 1 - pane["y"], frame["x"] + 1 - pane["x"]), (pane["height"], pane["width"])
+        return (0, 0), (pane["height"], pane["width"])
+
+    def clamp(self, pos):
+        """Keep a corner on the snipped pane, so the box never leaves the snapshot."""
+        return (min(max(pos[0], 0), self.pane_size[0] - 1), min(max(pos[1], 0), self.pane_size[1] - 1))
+
+    def row(self, r):
+        return self.grid[r] if 0 <= r < len(self.grid) else []
+
+    def sound(self, name):
+        """Ask bin/snip-sound's player for a sound. Fire and forget: no player, no sound."""
+        if self.speaker:
+            try:
+                self.speaker.sendto(name.encode(), cfg.SOUND_SOCKET)
+            except OSError:
+                pass
+
+    def cancel(self):
+        """Give up and close. The player is a separate process, so the sound
+        outlives this one."""
+        self.state, self.outcome = "cancelled", "cancelled"
+        self.sound("freeze")
+
+    # geometry
+
+    def box(self):
+        if self.state in ("locked", "ask", "pick", "sending", "done"):
+            p, q = self.a, self.b
+        elif self.state == "second":
+            p, q = self.a, (self.clamp(self.mouse) if self.mouse else self.a)
+        else:
+            return None
+        return min(p[0], q[0]), min(p[1], q[1]), max(p[0], q[0]), max(p[1], q[1])
+
+    def asking(self):
+        return self.state in ("ask", "pick", "sending", "done")
+
+    def bar_row(self):
+        """The hint bar sits on the edge away from the cursor; the cards replace it."""
+        if self.asking():
+            return None
+        rows, top = self.size.lines, self.off[0]
+        return top if self.mouse and self.mouse[0] - top >= rows // 2 else top + rows - 1
+
+    def visible_rows(self):
+        return max(1, min(len(self.agents), MAX_LIST))
+
+    def card_size(self):
+        cols = self.size.columns
+        if self.state == "ask":
+            return 11, max(34, min(68, cols - 4))
+        return 5 + self.visible_rows(), max(40, min(84, cols - 4))
+
+    def card_rect(self):
+        """Centered, unless that covers the box and there is room above or below it."""
+        cols, rows = self.size.columns, self.size.lines
+        top, left = self.off
+        h, w = self.card_size()
+        c0, r0 = left + max(0, (cols - w) // 2), top + max(0, (rows - h) // 2)
+        box = self.box()
+        if box and r0 <= box[2] + 1 and box[0] - 1 <= r0 + h - 1:
+            below = top + rows - box[2] - 3
+            above = box[0] - top - 2
+            if below >= h:
+                r0 = box[2] + 2 + (below - h) // 2
+            elif above >= h:
+                r0 = top + (above - h) // 2
+        return r0, c0, h, w
+
+    # drawing
+
+    def overlays(self, box, bar):
+        """Everything drawn on top of the snapshot, as {(row, col): (char, sgr)}."""
+        cols, rows = self.size.columns, self.size.lines
+        top, left = self.off
+        ov = {}
+
+        def put(r, c, ch, sgr):
+            if top <= r < top + rows and left <= c < left + cols and r != bar:
+                ov[(r, c)] = (ch, sgr)
+
+        if box:
+            r1, c1, r2, c2 = box
+            settled = self.state != "second"
+            tone = AMBER if settled else AMBER_MID
+            s = "1;" + fg(tone) + ";" + bg(FROST_BG)
+            for r, c, glyph, dr, dc in ((r1 - 1, c1 - 1, "┏", 1, 1), (r1 - 1, c2 + 1, "┓", 1, -1),
+                                        (r2 + 1, c1 - 1, "┗", -1, 1), (r2 + 1, c2 + 1, "┛", -1, -1)):
+                put(r, c, glyph, s)
+                put(r, c + dc, "━", s)
+                put(r, c + 2 * dc, "━", s)
+                put(r + dr, c, "┃", s)
+            w, h = c2 - c1 + 1, r2 - r1 + 1
+            if settled or w * h > 1:
+                label = " %d × %d " % (w, h)
+                if r2 + 2 < top + rows and r2 + 2 != bar:
+                    lr = r2 + 2
+                elif r1 - 2 >= top and r1 - 2 != bar:
+                    lr = r1 - 2
+                else:
+                    lr = r2
+                start = max(left, min(left + cols - len(label), c2 + 2 - len(label)))
+                ps = "1;" + fg(INK) + ";" + bg(tone)
+                for i, ch in enumerate(label):
+                    put(lr, start + i, ch, ps)
+
+        now = time.time()
+        for r, c, t0 in self.sparks:
+            frame = int((now - t0) / SPARK_FRAME)
+            for (dr, dc), (bits, color) in spark_cells(frame).items():
+                rr, cc = r + dr, c + dc
+                lit = box and box[0] <= rr <= box[2] and box[1] <= cc <= box[3]
+                put(rr, cc, chr(0x2800 + bits), "1;" + fg(color) + ";" + ("49" if lit else bg(FROST_BG)))
+            if frame in SPARK_CORE:
+                put(r, c, " ", bg(SPARK_CORE[frame]))
+        if self.asking():
+            self.draw_card(put)
+        return ov
+
+    def draw_card(self, put):
+        r0, c0, h, w = self.card_rect()
+        on_card = ";" + bg(CARD_BG)
+        edge = fg(CARD_EDGE) + on_card
+
+        def text(r, c, s, sgr):
+            for i, ch in enumerate(s):
+                put(r, c + i, ch, sgr)
+
+        for r in range(r0, r0 + h):
+            text(r, c0, " " * w, fg(BAR_FG) + on_card)
+            put(r, c0, "│", edge)
+            put(r, c0 + w - 1, "│", edge)
+        text(r0, c0, "╭" + "─" * (w - 2) + "╮", edge)
+        text(r0 + h - 1, c0, "╰" + "─" * (w - 2) + "╯", edge)
+        title = " Ask about this box " if self.state == "ask" else " Send to "
+        text(r0, c0 + 2, title, "1;" + fg(BAR_FG) + on_card)
+        if self.state == "ask":
+            self.draw_question(put, text, r0, c0, w, on_card)
+        else:
+            self.draw_agents(text, r0, c0, w, on_card)
+        self.draw_buttons(text, r0 + h - 2, c0, w, on_card)
+
+    def draw_question(self, put, text, r0, c0, w, on_card):
+        """An amber-edged field, three lines tall, with the real terminal cursor in it."""
+        fr, fc, fw = r0 + 2, c0 + 3, w - 6
+        fe = fg(AMBER) + on_card
+        well = ";" + bg(FIELD_BG)
+        text(fr, fc, "┌" + "─" * (fw - 2) + "┐", fe)
+        text(fr + 4, fc, "└" + "─" * (fw - 2) + "┘", fe)
+        shown = wrap(self.question, fw - 4)[-3:]
+        for i in range(3):
+            put(fr + 1 + i, fc, "│", fe)
+            put(fr + 1 + i, fc + fw - 1, "│", fe)
+            text(fr + 1 + i, fc + 1, " " * (fw - 2), fg(FIELD_FG) + well)
+            if i < len(shown):
+                text(fr + 1 + i, fc + 2, shown[i], fg(FIELD_FG) + well)
+        if not self.question:
+            text(fr + 1, fc + 2, "Type your question", fg(BAR_DIM) + well)
+        self.cursor = (fr + len(shown), fc + 2 + len(shown[-1]))
+        r1, c1, r2, c2 = self.box()
+        note = "The %d × %d box goes with it as text." % (c2 - c1 + 1, r2 - r1 + 1)
+        text(r0 + 7, fc + 1, note[:fw - 2], fg(BAR_DIM) + on_card)
+
+    def draw_agents(self, text, r0, c0, w, on_card):
+        """One row per agent: status dot, name, status, session title, pane.
+        The chosen row is solid amber; blocked agents are listed but can't be picked,
+        because Herdr refuses to prompt an agent waiting on an approval."""
+        self.list_rows = {}
+        top, col, inner = r0 + 2, c0 + 3, w - 6
+        if not self.agents:
+            msg = self.agents_error or "No agents are running in this Herdr server."
+            text(top, col, msg[:inner], fg(FAIL if self.agents_error else BAR_DIM) + on_card)
+            return
+        n = self.visible_rows()
+        if self.pick is not None:
+            self.scroll = min(max(self.scroll, self.pick - n + 1), self.pick)
+        names = [a.get("name") or a.get("pane_id") or "?" for a in self.agents]
+        name_w, status_w, right_w = min(16, max(6, max(len(n) for n in names))), 8, 9
+        title_w = max(0, inner - (2 + name_w + 1 + status_w + 1) - 1 - right_w)
+        for i in range(n):
+            k = self.scroll + i
+            if k >= len(self.agents):
+                break
+            a, r = self.agents[k], top + i
+            self.list_rows[r] = k
+            status = a.get("agent_status") or "unknown"
+            usable = status != "blocked"
+            chosen = k == self.pick
+            hovered = usable and self.mouse and self.mouse[0] == r and col - 1 <= self.mouse[1] <= col + inner
+            back = ";" + bg(AMBER if chosen else (BUTTON_HOVER if hovered else CARD_BG))
+            ink = INK if chosen else (BAR_FG if usable else DISABLED)
+            sub_ink = AMBER_INK if chosen else (BAR_DIM if usable else DISABLED)
+            right = "this pane" if a.get("pane_id") == self.source else (a.get("pane_id") or "")
+            x = col
+            text(r, col - 1, " " * (inner + 2), fg(ink) + back)
+            text(r, x, "●", fg(INK if chosen else STATUS.get(status, BAR_DIM)) + back)
+            x += 2
+            text(r, x, fit(names[k], name_w), "1;" + fg(ink) + back)
+            x += name_w + 1
+            text(r, x, fit(status, status_w), fg(sub_ink) + back)
+            x += status_w + 1
+            text(r, x, fit(a.get("terminal_title_stripped") or a.get("cwd") or "", title_w), fg(ink) + back)
+            text(r, col + inner - right_w, right.rjust(right_w) if len(right) <= right_w else fit(right, right_w),
+                 fg(sub_ink) + back)
+        if self.scroll > 0:
+            text(top - 1, c0 + w - 4, "▲", fg(BAR_DIM) + on_card)
+        if self.scroll + n < len(self.agents):
+            text(top + n, c0 + w - 4, "▼", fg(BAR_DIM) + on_card)
+
+    def draw_buttons(self, text, row, c0, w, on_card):
+        self.buttons, self.button_row = {}, row
+        if self.state not in ("ask", "pick"):
+            msg = ("Sending to %s…" % self.target_label()) if self.state == "sending" else self.flash
+            tone = FAIL if self.outcome == "send_failed" else AMBER
+            text(row, max(c0 + 2, c0 + w - 4 - len(msg) + 1), msg[:w - 4], "1;" + fg(tone) + on_card)
+            return
+        word = "Continue" if self.state == "ask" else "Send"
+        enabled = self.state == "ask" or self.pick is not None
+
+        def hover(span):
+            return self.mouse and self.mouse[0] == row and span[0] <= self.mouse[1] <= span[1]
+
+        p_end = c0 + w - 4
+        p_start = p_end - len(" %s  Enter " % word) + 1
+        b_end = p_start - 3
+        b_start = b_end - len(" Back  Esc ") + 1
+        if enabled:
+            self.buttons["primary"] = (p_start, p_end)
+            pb = ";" + bg(AMBER_HOVER if hover((p_start, p_end)) else AMBER)
+            text(row, p_start, " %s " % word, "1;" + fg(INK) + pb)
+            text(row, p_start + len(word) + 2, " Enter ", fg(AMBER_INK) + pb)
+        else:
+            text(row, p_start, " %s  Enter " % word, fg(DISABLED) + ";" + bg(BUTTON_BG))
+        self.buttons["back"] = (b_start, b_end)
+        bb = ";" + bg(BUTTON_HOVER if hover((b_start, b_end)) else BUTTON_BG)
+        text(row, b_start, " Back ", "1;" + fg(BAR_FG) + bb)
+        text(row, b_start + 6, " Esc ", fg(BAR_DIM) + bb)
+
+    def style(self, r, c, cell, box):
+        """The SGR for a snapshot cell: live colors inside the box, frozen outside."""
+        m = self.mouse
+        if m == (r, c) and self.state in ("first", "second"):
+            return "1;" + fg(INK) + ";" + bg(AMBER)
+        if box and box[0] <= r <= box[2] and box[1] <= c <= box[3]:
+            return true_sgr(cell["st"]) if cell else ""
+        if self.asking():
+            return fg(BACKDROP_FG) + ";" + bg(BACKDROP_BG)
+        tone = frost_tone(cell["st"]) if cell else "mid"
+        guide = self.state == "first" and m and (r == m[0] or c == m[1])
+        back = GUIDE_BG if guide else (FROST_BG_SET if cell and cell["st"][1] else FROST_BG)
+        bold = "1;" if cell and 1 in cell["st"][2] else ""
+        return bold + fg(FROST_FG[tone]) + ";" + bg(back)
+
+    def bar_line(self, cols):
+        keys = [("Esc", "cancels")]
+        if self.state == "first":
+            msg = "Click the top-left corner of the area you want."
+        elif self.state == "second":
+            msg = "Corner set at row %d, column %d. Now click the bottom-right corner." % (self.a[0] + 1, self.a[1] + 1)
+        else:
+            r1, c1, r2, c2 = self.box()
+            msg = "%d × %d selected." % (c2 - c1 + 1, r2 - r1 + 1)
+            keys = [("Enter", "asks"), ("r", "redoes"), ("Esc", "cancels")]
+        base = ";" + bg(BAR_BG)
+        left = [("▌", fg(AMBER) + base), (" " + msg, fg(BAR_FG) + base)]
+        right = []
+        for k, d in keys:
+            right += [(k, "1;" + fg(AMBER) + base), (" " + d + "   ", fg(BAR_FG) + base)]
+        if self.mouse and self.state in ("first", "second"):
+            right.insert(0, ("row %d  col %d     " % (self.mouse[0] + 1, self.mouse[1] + 1), fg(BAR_DIM) + base))
+
+        def width(segs):
+            return sum(len(t) for t, _ in segs)
+
+        # short on room: drop the position readout first, then the key hints
+        if width(left) + width(right) + 2 > cols and len(right) > 2 * len(keys):
+            right = right[1:]
+        if width(left) + width(right) + 2 > cols:
+            right = []
+        if width(left) > cols:
+            left[1] = (left[1][0][:max(0, cols - 1)], left[1][1])
+        segs = left + [(" " * (cols - width(left) - width(right)), fg(BAR_FG) + base)] + right
+        return "".join("\x1b[0;%sm%s" % (sgr, t) for t, sgr in segs) + "\x1b[0m"
+
+    def render(self):
+        cols, rows = self.size.columns, self.size.lines
+        top, left = self.off
+        box = self.box()
+        bar = self.bar_row()
+        ov = self.overlays(box, bar)
+        out = ["\x1b[?2026h"]
+        for r in range(top, top + rows):
+            out.append("\x1b[%d;1H" % (r - top + 1))
+            if r == bar:
+                out.append(self.bar_line(cols))
+                continue
+            row = self.row(r)
+            # a wide glyph is blanked when anything is drawn over either half
+            broken = {c for c in range(len(row)) if row[c]["w"] == 2
+                      and ((r, c) in ov or (r, c + 1) in ov or c + 1 >= left + cols)}
+            last, c = None, left
+            while c < left + cols:
+                cell = row[c] if 0 <= c < len(row) else None
+                if (r, c) in ov:
+                    ch, sgr = ov[(r, c)]
+                elif cell is None:
+                    ch, sgr = " ", self.style(r, c, None, box)
+                elif cell["w"] == 0:
+                    if c - 1 not in broken and c > left:
+                        c += 1
+                        continue
+                    ch, sgr = " ", self.style(r, c, cell, box)
+                elif c in broken:
+                    ch, sgr = " ", self.style(r, c, cell, box)
+                else:
+                    ch, sgr = cell["ch"], self.style(r, c, cell, box)
+                if sgr != last:
+                    out.append("\x1b[0;%sm" % sgr)
+                    last = sgr
+                out.append(ch)
+                c += 1
+            out.append("\x1b[0m")
+        if self.state == "ask" and self.cursor:
+            out.append("\x1b[%d;%dH\x1b[5 q\x1b[?25h" % (self.cursor[0] - top + 1, self.cursor[1] - left + 1))
+        else:
+            out.append("\x1b[?25l")
+        out.append("\x1b[?2026l")
+        os.write(1, "".join(out).encode())
+
+    # input
+
+    def click(self, pos):
+        if self.state in ("ask", "pick"):
+            if pos[0] == self.button_row:
+                hit = next((n for n, (c1, c2) in self.buttons.items() if c1 <= pos[1] <= c2), None)
+                if hit == "back":
+                    self.back()
+                elif hit == "primary":
+                    self.open_pick() if self.state == "ask" else self.send()
+            elif self.state == "pick" and pos[0] in self.list_rows:
+                k = self.list_rows[pos[0]]
+                if self.agents[k].get("agent_status") != "blocked" and k != self.pick:
+                    self.pick = k
+                    self.sound("select")
+            return
+        if self.state not in ("first", "second", "locked"):
+            return
+        pos = self.clamp(pos)
+        self.clicks.append({"row": pos[0] + 1, "col": pos[1] + 1})
+        self.sparks.append((pos[0], pos[1], time.time()))
+        if self.state in ("first", "locked"):
+            self.a, self.b, self.state = pos, None, "second"
+            self.sound("hit")
+        else:
+            self.b, self.state = pos, "locked"
+            self.sound("lock")
+
+    def back(self):
+        """One card back: the agent list to the question, the question to the box."""
+        self.state = "locked" if self.state == "ask" else "ask"
+        self.sound("back")
+        self.dirty = True
+
+    def mouse_event(self, params, press):
+        try:
+            b, x, y = (int(v) for v in params.split(";"))
+        except ValueError:
+            return
+        pos = (y - 1 + self.off[0], x - 1 + self.off[1])
+        if b & 64:
+            self.counts["wheel"] += 1
+            return
+        if b & 32:
+            self.counts["motion"] += 1
+            # a tick per cell the cursor steps onto, at most ~30 a second
+            if pos != self.mouse and self.state in ("first", "second") and time.time() - self.last_tick >= 0.033:
+                self.last_tick = time.time()
+                self.sound("move")
+            self.mouse = pos
+            self.dirty = True
+            return
+        if not press:
+            self.counts["release"] += 1
+            return
+        self.counts["press"] += 1
+        self.mouse = pos
+        if b & 3 == 0:
+            self.click(pos)
+        self.dirty = True
+
+    def key(self, ch):
+        """A key outside the question field."""
+        if self.state == "pick":
+            if ch in (b"\r", b"\n") and self.pick is not None:
+                self.send()
+            elif ch in (b"k", b"j"):
+                self.move(-1 if ch == b"k" else 1)
+            elif ch == b"\x03":
+                self.cancel()
+        elif ch in (b"\r", b"\n") and self.state == "locked":
+            self.state = "ask"
+            self.sound("continue")
+        elif ch == b"r" and self.state in ("second", "locked"):
+            self.a = self.b = None
+            self.state = "first"
+            self.sound("back")
+        elif ch in (b"q", b"\x03"):
+            self.cancel()
+        self.dirty = True
+
+    def type_key(self, b):
+        """A key in the question field."""
+        if b in (b"\r", b"\n"):
+            self.open_pick()
+        elif b in (b"\x7f", b"\x08", b"\x15"):
+            if self.question:
+                self.sound("erase")
+            self.question = "" if b == b"\x15" else self.question[:-1]
+        elif b == b"\x03":
+            self.cancel()
+        else:
+            typed = "".join(ch for ch in self.decoder.decode(b) if ch.isprintable())
+            if typed:
+                self.keys_typed += 1
+                self.sound("type%d" % (self.keys_typed % 3 + 1))
+            self.question += typed
+        self.dirty = True
+
+    def move(self, d):
+        """Move the agent selection, skipping blocked agents."""
+        k = self.pick
+        while k is not None and 0 <= k + d < len(self.agents):
+            k += d
+            if self.agents[k].get("agent_status") != "blocked":
+                self.pick = k
+                self.sound("select")
+                break
+        self.dirty = True
+
+    def open_pick(self):
+        """List the agents in this Herdr server and preselect the last one sent to,
+        else the first agent outside the snipped pane."""
+        self.state, self.agents, self.agents_error, self.pick, self.scroll = "pick", [], None, None, 0
+        self.sound("continue")
+        try:
+            data = json.loads(cfg.run_herdr("agent", "list").stdout)
+            if "error" in data:
+                raise RuntimeError(data["error"].get("message", "herdr error"))
+            self.agents = data["result"]["agents"]
+        except Exception as e:
+            self.agents_error = "Couldn't list agents: %s" % (str(e) or type(e).__name__)
+        usable = [k for k, a in enumerate(self.agents) if a.get("agent_status") != "blocked"]
+        last = read_text(self.dir / "last-target")
+        self.pick = next((k for k in usable
+                          if last and last in (self.agents[k].get("name"), self.agents[k].get("pane_id"))), None)
+        if self.pick is None:
+            self.pick = next((k for k in usable if self.agents[k].get("pane_id") != self.source),
+                             usable[0] if usable else None)
+        self.dirty = True
+
+    def target_label(self):
+        a = self.agents[self.pick] if self.pick is not None else {}
+        return a.get("name") or a.get("pane_id") or "?"
+
+    def source_info(self):
+        """The agent (or bare pane) the box came from, captured by bin/snip-open."""
+        try:
+            res = json.loads((self.dir / "source.json").read_text(encoding="utf-8")).get("result", {})
+        except (OSError, ValueError):
+            return {}
+        return res.get("agent") or res.get("pane") or {}
+
+    def box_text(self, box):
+        r1, c1, r2, c2 = box
+        return "\n".join(row_text(self.row(r), c1, c2) for r in range(r1, r2 + 1))
+
+    def compose(self, target_pane):
+        """Who sent it, where the box came from, then the box. Without the header
+        the receiver can't tell whose screen it is looking at."""
+        r1, c1, r2, c2 = self.final_box
+        src, pane = self.source_info(), self.source or "?"
+        name = src.get("name")
+        who = "%s (the operator)" % self.operator if self.operator else "The operator"
+        if pane == target_pane:
+            where = "your own screen"
+        elif name:
+            where = "agent %s's screen" % name
+        else:
+            where = "the screen of pane %s" % pane
+        q = self.question.strip()
+        lines = ["%s boxed part of %s and %s" % (who, where, "is asking:" if q else "sent it to you.")]
+        if q:
+            lines.append(q)
+        lines.append("")
+        if name or src.get("agent"):
+            lines.append("Source agent: %s (%s), pane %s" % (name or "unnamed", src.get("agent") or "agent", pane))
+        else:
+            lines.append("Source pane: %s (no agent running there)" % pane)
+        if src.get("terminal_title_stripped"):
+            lines.append("Session: %s" % src["terminal_title_stripped"])
+        if src.get("cwd"):
+            lines.append("Directory: %s" % src["cwd"])
+        lines.append("Box: rows %d-%d, columns %d-%d" % (r1 + 1, r2 + 1, c1 + 1, c2 + 1))
+        return "\n".join(lines) + "\n```\n%s\n```" % self.box_text(self.final_box)
+
+    def send(self):
+        target = self.target_label()
+        target_pane = self.agents[self.pick].get("pane_id")
+        self.final_box = self.box()
+        self.state = "sending"
+        self.render()
+        error = None
+        try:
+            p = cfg.run_herdr("agent", "prompt", target, self.compose(target_pane), timeout=30)
+            out = (p.stdout + p.stderr).strip()
+            if p.returncode != 0 or '"error"' in out:
+                try:
+                    error = json.loads(p.stdout)["error"]["message"]
+                except (ValueError, KeyError, TypeError):
+                    error = out[-200:] or "herdr exited with %d" % p.returncode
+            self.send_log = {"to": target, "rc": p.returncode, "out": out[-500:]}
+        except Exception as e:
+            error = str(e) or type(e).__name__
+            self.send_log = {"to": target, "error": repr(e)}
+        if error is None:
+            (self.dir / "last-target").write_text(target + "\n", encoding="utf-8")
+            self.outcome, self.flash = "sent", "Sent to %s." % target
+        else:
+            self.outcome, self.flash = "send_failed", "Couldn't send to %s: %s" % (target, error)
+        self.sound("sent" if error is None else "error")
+        self.state = "done"
+
+    def consume(self, buf):
+        """Handle buffered input; return whatever is left of an incomplete sequence."""
+        while buf and self.state in ("first", "second", "locked", "ask", "pick"):
+            if buf.startswith(b"\x1b[<"):
+                end = next((i for i in range(3, len(buf)) if buf[i:i + 1] in (b"M", b"m")), None)
+                if end is None:
+                    return buf if len(buf) < 64 else b""
+                self.mouse_event(buf[3:end].decode(errors="replace"), buf[end:end + 1] == b"M")
+                buf = buf[end + 1:]
+            elif buf.startswith(b"\x1b[") or buf.startswith(b"\x1bO"):
+                end = next((i for i in range(2, len(buf)) if 0x40 <= buf[i] <= 0x7E), None)
+                if end is None:
+                    return buf
+                if self.state == "pick" and buf[end:end + 1] in (b"A", b"B"):
+                    self.move(-1 if buf[end:end + 1] == b"A" else 1)
+                buf = buf[end + 1:]
+            elif buf == b"\x1b":
+                # a lone Esc, unless the rest of a sequence is about to arrive
+                ready, _, _ = select.select([0], [], [], 0.03)
+                if ready:
+                    buf += os.read(0, 4096)
+                    continue
+                if self.state in ("ask", "pick"):
+                    self.back()
+                else:
+                    self.cancel()
+                return b""
+            elif buf[:1] == b"\x1b":
+                buf = buf[2:]
+            elif self.state == "ask":
+                self.type_key(buf[:1])
+                buf = buf[1:]
+            else:
+                self.key(buf[:1])
+                buf = buf[1:]
+        return buf
+
+    def run(self):
+        buf = b""
+        while True:
+            if self.resized:
+                self.size, self.resized, self.dirty = os.get_terminal_size(1), False, True
+                self.off, self.pane_size = self.geometry()
+            now = time.time()
+            had = bool(self.sparks)
+            self.sparks = [s for s in self.sparks if now - s[2] < SPARK_FRAME * SPARK_STEPS]
+            if self.dirty or self.sparks or had:
+                self.render()
+                self.dirty = False
+            if self.state == "done":
+                time.sleep(0.8 if self.outcome == "sent" else 2.5)
+                return
+            if self.state == "cancelled":
+                return
+            if now - self.last_input > IDLE_CLOSE:
+                self.outcome = "timeout"
+                return
+            ready, _, _ = select.select([0], [], [], SPARK_FRAME / 2 if self.sparks else 0.5)
+            if not ready:
+                continue
+            data = os.read(0, 4096)
+            if not data:
+                self.outcome = "eof"
+                return
+            self.last_input = time.time()
+            buf = self.consume(buf + data)
+
+    def write_result(self):
+        """What happened, for troubleshooting: result.json in the state folder."""
+        res = {
+            "outcome": self.outcome,
+            "box": None,
+            "question": self.question,
+            "send": self.send_log,
+            "clicks": self.clicks,
+            "mouse_events": self.counts,
+            "overlay": {"cols": self.size.columns, "rows": self.size.lines, "offset": list(self.off)},
+            "duration_s": round(time.time() - self.started, 1),
+        }
+        if self.final_box:
+            r1, c1, r2, c2 = self.final_box
+            res["box"] = {"top": r1 + 1, "left": c1 + 1, "bottom": r2 + 1, "right": c2 + 1}
+            res["text"] = self.box_text(self.final_box)
+        tmp = self.dir / "result.json.tmp"
+        tmp.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.dir / "result.json")
+
+
+def main():
+    state = cfg.state_dir()
+    snip = None
+    old = None
+    try:
+        raw = (state / "snapshot.ansi").read_text(encoding="utf-8", errors="replace")
+        snip = Snip(parse_snapshot(raw), state, cfg.settings())
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(snip, "resized", True))
+        old = termios.tcgetattr(0)
+        tty.setraw(0)
+        os.write(1, ENTER.encode())
+        snip.run()
+    except Exception:
+        (state / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        if snip:
+            snip.outcome = "error"
+    finally:
+        if old is not None:
+            os.write(1, LEAVE.encode())
+            termios.tcsetattr(0, termios.TCSADRAIN, old)
+        if snip:
+            snip.write_result()
+        else:
+            (state / "result.json").write_text('{"outcome": "error"}\n', encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

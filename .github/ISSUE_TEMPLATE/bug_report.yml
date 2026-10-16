@@ -1,0 +1,31 @@
+name: Bug report
+description: Something in Snip doesn't work as described.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: herdr
+    attributes:
+      label: Herdr version
+      description: The output of `herdr --version`.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS and terminal
+      placeholder: Ubuntu 24.04 on WSL2, Windows Terminal
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: result.json
+      description: The contents of `~/.local/state/herdr-snip/result.json` from the snip that went wrong. Remove anything private from the `text` and `question` fields first.
+      render: json

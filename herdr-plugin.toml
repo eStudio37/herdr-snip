@@ -1,0 +1,21 @@
+id = "estudio37.snip"
+name = "Snip"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Freeze a pane, box part of it with two clicks, and ask any agent about it."
+platforms = ["linux", "macos"]
+
+# Saves the active pane's screen, then opens the picker over it.
+[[actions]]
+id = "open"
+title = "Snip part of this pane"
+description = "Freeze this pane, box part of it, and send it to an agent with a question."
+contexts = ["pane", "workspace", "global"]
+command = ["python3", "-I", "bin/snip-open"]
+
+# The picker: the frozen pane, the two clicks, the question and agent cards.
+[[panes]]
+id = "snip"
+title = "snip"
+placement = "overlay"
+command = ["python3", "-I", "bin/snip"]

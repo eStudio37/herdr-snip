@@ -1,0 +1,41 @@
+{
+  "id": "cli:agent:list",
+  "type": "agent_list",
+  "result": {
+    "type": "agent_list",
+    "agents": [
+      {
+        "agent": "claude",
+        "name": "tess",
+        "pane_id": "w1:p1",
+        "agent_status": "idle",
+        "cwd": "/home/dev/parser",
+        "terminal_title_stripped": "Fix the quote parser"
+      },
+      {
+        "agent": "codex",
+        "name": "rook",
+        "pane_id": "w1:p2",
+        "agent_status": "working",
+        "cwd": "/home/dev/parser",
+        "terminal_title_stripped": "Review tokenizer changes"
+      },
+      {
+        "agent": "claude",
+        "name": "mira",
+        "pane_id": "w2:p1",
+        "agent_status": "blocked",
+        "cwd": "/home/dev/site",
+        "terminal_title_stripped": "Waiting on a permission prompt"
+      },
+      {
+        "agent": "claude",
+        "name": "orchestrator",
+        "pane_id": "w3:p1",
+        "agent_status": "idle",
+        "cwd": "/home/dev",
+        "terminal_title_stripped": "Coordinate the parser work"
+      }
+    ]
+  }
+}

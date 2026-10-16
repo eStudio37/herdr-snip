@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""snip-sound: 8-bit sound effects for the snip picker.
+
+usage: snip-sound play NAME     play a sound, starting the player if needed
+       snip-sound stop          stop the player
+
+The sounds are synthesized here (pulse, NES-style triangle and noise) and handed
+as raw 16-bit PCM to one long-lived Windows PowerShell process. That process
+compiles a small mixer (SnipMixer, below) that opens the audio device once and
+keeps a stream of ~12 ms buffers running, mixing every requested sound into it.
+
+Why a mixer: playing each sound on its own (System.Media.SoundPlayer) reopens
+the device per sound, and that start-up delay is longer than the gap between
+fast keystrokes, so each new tick cancelled the last before it was heard. The
+open stream also keeps Bluetooth headsets awake, so short sounds aren't clipped.
+While the stream is open Windows won't idle-sleep, so the player quits after
+IDLE seconds without a request.
+
+Sound needs WSL: Windows audio is reached through Windows PowerShell, since a
+Linux audio server is often missing there. Anywhere PowerShell isn't found, this
+does nothing and the plugin runs silent. Requests travel as datagrams on an
+abstract unix socket, so senders never wait.
+"""
+import base64
+import os
+import socket
+import subprocess
+import sys
+from array import array
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import snip_settings as cfg  # noqa: E402
+
+IDLE = 600
+POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+RATE = 22050
+# gain applied on top of the levels written in sounds(), then scaled by the
+# `volume` setting; the mouse sounds are trimmed harder, the cursor tick most,
+# because it fires dozens of times a second
+VOLUME = 0.6
+VOLUME_BY_SOUND = {"hit": 0.3, "lock": 0.3, "move": 0.165, "sent": 0.3}
+
+MIXER = r"""
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public class SnipMixer {
+    [StructLayout(LayoutKind.Sequential)]
+    struct WaveFormat { public short tag, channels; public int rate, bytesPerSec; public short blockAlign, bits, extra; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct WaveHdr { public IntPtr data; public int length, recorded; public IntPtr user; public int flags, loops; public IntPtr next, reserved; }
+
+    [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr h, IntPtr device, ref WaveFormat fmt, IntPtr cb, IntPtr inst, int flags);
+    [DllImport("winmm.dll")] static extern int waveOutPrepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutUnprepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutWrite(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr h);
+
+    const int Rate = 22050, Frames = 256, Buffers = 5, Done = 1;
+    class Voice { public float[] S; public int Pos; }
+
+    readonly Dictionary<string, float[]> sounds = new Dictionary<string, float[]>();
+    readonly List<Voice> voices = new List<Voice>();
+    readonly object gate = new object();
+    readonly float[] mix = new float[Frames];
+    readonly short[] pcm = new short[Frames];
+    readonly IntPtr[] hdrs = new IntPtr[Buffers], data = new IntPtr[Buffers];
+    readonly int hdrSize = Marshal.SizeOf(typeof(WaveHdr));
+    readonly int flagsAt = Marshal.OffsetOf(typeof(WaveHdr), "flags").ToInt32();
+    IntPtr dev;
+    volatile bool running;
+    Thread pump;
+
+    public void Load(string name, string b64) {
+        byte[] b = Convert.FromBase64String(b64);
+        float[] s = new float[b.Length / 2];
+        for (int i = 0; i < s.Length; i++) s[i] = BitConverter.ToInt16(b, i * 2) / 32768f;
+        lock (gate) sounds[name] = s;
+    }
+
+    public void Play(string name) {
+        lock (gate) {
+            float[] s;
+            if (sounds.TryGetValue(name, out s)) voices.Add(new Voice { S = s, Pos = 0 });
+        }
+    }
+
+    public void Start() {
+        WaveFormat f = new WaveFormat { tag = 1, channels = 1, rate = Rate, bytesPerSec = Rate * 2, blockAlign = 2, bits = 16 };
+        int r = waveOutOpen(out dev, new IntPtr(-1), ref f, IntPtr.Zero, IntPtr.Zero, 0);
+        if (r != 0) throw new Exception("waveOutOpen failed: " + r);
+        for (int i = 0; i < Buffers; i++) {
+            data[i] = Marshal.AllocHGlobal(Frames * 2);
+            hdrs[i] = Marshal.AllocHGlobal(hdrSize);
+            Marshal.StructureToPtr(new WaveHdr { data = data[i], length = Frames * 2 }, hdrs[i], false);
+            waveOutPrepareHeader(dev, hdrs[i], hdrSize);
+            Submit(i);
+        }
+        running = true;
+        pump = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.AboveNormal };
+        pump.Start();
+    }
+
+    void Loop() {
+        while (running) {
+            for (int i = 0; i < Buffers; i++)
+                if ((Marshal.ReadInt32(hdrs[i], flagsAt) & Done) != 0) Submit(i);
+            Thread.Sleep(2);
+        }
+    }
+
+    void Submit(int i) {
+        Array.Clear(mix, 0, Frames);
+        lock (gate) {
+            for (int v = voices.Count - 1; v >= 0; v--) {
+                Voice vc = voices[v];
+                int n = Math.Min(Frames, vc.S.Length - vc.Pos);
+                for (int k = 0; k < n; k++) mix[k] += vc.S[vc.Pos + k];
+                vc.Pos += n;
+                if (vc.Pos >= vc.S.Length) voices.RemoveAt(v);
+            }
+        }
+        for (int k = 0; k < Frames; k++) {
+            float x = mix[k] > 1f ? 1f : (mix[k] < -1f ? -1f : mix[k]);
+            pcm[k] = (short)(x * 32767);
+        }
+        Marshal.Copy(pcm, 0, data[i], Frames);
+        Marshal.WriteInt32(hdrs[i], flagsAt, Marshal.ReadInt32(hdrs[i], flagsAt) & ~Done);
+        waveOutWrite(dev, hdrs[i], hdrSize);
+    }
+
+    public void Stop() {
+        running = false;
+        if (pump != null) pump.Join(500);
+        waveOutReset(dev);
+        for (int i = 0; i < Buffers; i++) waveOutUnprepareHeader(dev, hdrs[i], hdrSize);
+        waveOutClose(dev);
+    }
+}
+"""
+
+PLAYER = "Add-Type -TypeDefinition @'\n" + MIXER + "\n'@\n" + r"""
+$m = New-Object SnipMixer
+$m.Start()
+[Console]::Out.WriteLine('ready')
+[Console]::Out.Flush()
+$in = [Console]::In
+while ($true) {
+  $line = $in.ReadLine()
+  if ($line -eq $null) { break }
+  $p = $line.Split(' ')
+  if ($p[0] -eq 'load') { $m.Load($p[1], $p[2]) }
+  elseif ($p[0] -eq 'play') { $m.Play($p[1]) }
+  elseif ($p[0] -eq 'quit') { break }
+}
+$m.Stop()
+"""
+
+
+# ---- synthesis --------------------------------------------------------------
+
+def note(midi):
+    return 440.0 * 2 ** ((midi - 69) / 12)
+
+
+def glide(f0, f1):
+    return lambda t: f0 * (f1 / f0) ** t
+
+
+def pulse(freq, dur, vol, duty=0.25, decay=1.5):
+    """Pulse wave; freq is Hz or a function of t in 0..1. A 2 ms attack keeps it
+    from clicking; the decay exponent shapes how fast it dies."""
+    n, out, phase = int(RATE * dur), [], 0.0
+    for i in range(n):
+        t = i / n
+        phase = (phase + (freq(t) if callable(freq) else freq) / RATE) % 1.0
+        env = (1 - t) ** decay * min(1.0, i / (RATE * 0.002))
+        out.append(vol * env * (1.0 if phase < duty else -1.0))
+    return out
+
+
+def triangle(freq, dur, vol, decay=1.5):
+    """Triangle stepped to 16 levels like the NES triangle channel: soft, round, dull."""
+    n, out, phase = int(RATE * dur), [], 0.0
+    for i in range(n):
+        t = i / n
+        phase = (phase + (freq(t) if callable(freq) else freq) / RATE) % 1.0
+        tri = round((4 * abs(phase - 0.5) - 1) * 7.5) / 7.5
+        out.append(vol * (1 - t) ** decay * min(1.0, i / (RATE * 0.004)) * tri)
+    return out
+
+
+def click(freq, dur, vol):
+    """A tick with no fade-in: the sharp onset is the whole sound."""
+    n, half = int(RATE * dur), RATE / freq / 2
+    return [vol * (1 - i / n) ** 2 * (1.0 if int(i / half) % 2 == 0 else -1.0) for i in range(n)]
+
+
+def noise(dur, vol):
+    """15-bit LFSR noise clocked at half rate, like the NES noise channel."""
+    n, out, lfsr, val = int(RATE * dur), [], 0x7FFF, 1.0
+    for i in range(n):
+        if i % 2 == 0:
+            bit = (lfsr ^ (lfsr >> 1)) & 1
+            lfsr = (lfsr >> 1) | (bit << 14)
+            val = 1.0 if lfsr & 1 else -1.0
+        out.append(vol * (1 - i / n) ** 2 * val)
+    return out
+
+
+def lowpass(samples, k):
+    """One-pole lowpass: smaller k, duller sound."""
+    y, out = 0.0, []
+    for x in samples:
+        y += k * (x - y)
+        out.append(y)
+    return out
+
+
+def level(samples, peak):
+    """Scale to a given peak, so layered sounds can't clip."""
+    top = max(abs(x) for x in samples) or 1.0
+    return [x * peak / top for x in samples]
+
+
+def silence(dur):
+    return [0.0] * int(RATE * dur)
+
+
+def seq(*parts):
+    return [s for p in parts for s in p]
+
+
+def mix(*parts):
+    out = [0.0] * max(len(p) for p in parts)
+    for p in parts:
+        for i, s in enumerate(p):
+            out[i] += s
+    return out
+
+
+def sounds():
+    return {
+        # the screen freezes like a fridge door opening: the seal lets go with a low
+        # thwop, a puff of muffled air, then a faint hum
+        "freeze": level(mix(triangle(glide(170, 65), 0.16, 0.5, 1.3),
+                            lowpass(noise(0.12, 0.9), 0.06),
+                            seq(silence(0.06), triangle(98, 0.24, 0.07, 1.0))), 0.45),
+        # the cursor steps onto another cell
+        "move": click(1500, 0.012, 0.2),
+        # first corner: a hit, noise crack over a falling blip
+        "hit": mix(noise(0.03, 0.22), pulse(glide(1400, 420), 0.08, 0.3)),
+        # second corner: the hit plus a rising two-note confirm
+        "lock": seq(mix(noise(0.025, 0.2), pulse(glide(1400, 500), 0.06, 0.28)),
+                    pulse(note(79), 0.04, 0.22), pulse(note(86), 0.08, 0.22)),
+        "type1": pulse(1880, 0.012, 0.11, 0.5, 2),
+        "type2": pulse(2090, 0.012, 0.11, 0.5, 2),
+        "type3": pulse(2300, 0.012, 0.11, 0.5, 2),
+        "erase": pulse(glide(1100, 650), 0.025, 0.11, 0.5, 2),
+        "continue": seq(pulse(note(84), 0.03, 0.2), pulse(note(91), 0.06, 0.2)),
+        "back": seq(pulse(note(84), 0.03, 0.18), pulse(note(77), 0.06, 0.18)),
+        "select": pulse(note(88), 0.03, 0.14),
+        "sent": seq(*(pulse(note(m), 0.05, 0.2, 0.25, 0.8) for m in (72, 76, 79)), pulse(note(84), 0.16, 0.22)),
+        "error": pulse(glide(220, 110), 0.2, 0.22, 0.5, 1),
+    }
+
+
+def to_pcm(samples):
+    return array("h", (int(max(-1.0, min(1.0, s)) * 32767) for s in samples)).tobytes()
+
+
+# ---- player -----------------------------------------------------------------
+
+def send(name):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.sendto(name.encode(), cfg.SOUND_SOCKET)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def serve(first):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.bind(cfg.SOUND_SOCKET)
+    except OSError:
+        return  # already running
+    script = base64.b64encode(PLAYER.encode("utf-16-le")).decode()
+    master = cfg.volume(cfg.settings())
+    with open(cfg.state_dir() / "sound.log", "ab") as log:
+        ps = subprocess.Popen([POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
+                              stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+    try:
+        for name, samples in sounds().items():
+            gain = VOLUME_BY_SOUND.get(name, VOLUME) * master
+            ps.stdin.write("load %s %s\n" % (name, base64.b64encode(to_pcm([s * gain for s in samples])).decode()))
+        if first:
+            ps.stdin.write("play %s\n" % first)
+        ps.stdin.flush()
+        sock.settimeout(IDLE)
+        while True:
+            try:
+                name = sock.recv(64).decode(errors="ignore").strip()
+            except socket.timeout:
+                break
+            if name == "quit":
+                break
+            ps.stdin.write("play %s\n" % name)
+            ps.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            ps.stdin.write("quit\n")
+            ps.stdin.close()
+            ps.wait(timeout=3)
+        except Exception:
+            ps.kill()
+        sock.close()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "play" and len(sys.argv) > 2:
+        if not send(sys.argv[2]) and os.path.exists(POWERSHELL):
+            subprocess.Popen([sys.executable, "-I", __file__, "serve", sys.argv[2]], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif cmd == "serve":
+        serve(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "stop":
+        send("quit")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

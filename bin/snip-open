@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""snip-open: the plugin's "open" action.
+
+Saves the active pane's screen and opens the picker (bin/snip) as an overlay over
+it. Herdr only opens overlays over the active pane, so that is the pane saved.
+Also records who is in that pane and where it sits in its tab, and starts the
+freeze sound first so it lands as the screen freezes.
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+import snip_settings as cfg  # noqa: E402
+
+
+def main():
+    if cfg.sound_on(cfg.settings()):
+        subprocess.run([sys.executable, "-I", str(ROOT / "bin" / "snip-sound"), "play", "freeze"], timeout=5)
+
+    panes = json.loads(cfg.run_herdr("pane", "list").stdout)["result"]["panes"]
+    pane = next((p["pane_id"] for p in panes if p.get("focused")), None)
+    if not pane:
+        sys.exit("snip: no active pane")
+
+    state = cfg.state_dir()
+    for name in ("result.json", "error.txt", "source.json", "source-layout.json"):
+        try:
+            (state / name).unlink()
+        except FileNotFoundError:
+            pass
+    snapshot = cfg.run_herdr("pane", "read", pane, "--source", "visible", "--format", "ansi")
+    (state / "snapshot.ansi").write_text(snapshot.stdout, encoding="utf-8")
+    (state / "source-pane").write_text(pane + "\n", encoding="utf-8")
+    # who the box comes from, as of now: the agent in that pane, else the bare pane
+    source = cfg.run_herdr("agent", "get", pane)
+    if source.returncode != 0 or '"error"' in source.stdout:
+        source = cfg.run_herdr("pane", "get", pane)
+    (state / "source.json").write_text(source.stdout, encoding="utf-8")
+    # where the pane sits in its tab, so the frozen copy lines up with the live screen
+    layout = cfg.run_herdr("pane", "layout", "--pane", pane)
+    (state / "source-layout.json").write_text(layout.stdout, encoding="utf-8")
+
+    opened = cfg.run_herdr("plugin", "pane", "open", "--plugin", cfg.PLUGIN_ID, "--entrypoint", "snip",
+                           "--placement", "overlay", "--cwd", str(ROOT))
+    if opened.returncode != 0:
+        sys.exit("snip: couldn't open the overlay: " + (opened.stdout + opened.stderr).strip())
+
+
+if __name__ == "__main__":
+    main()

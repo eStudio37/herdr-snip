@@ -1,0 +1,14 @@
+{
+  "id": "cli:agent:get",
+  "result": {
+    "type": "agent_info",
+    "agent": {
+      "agent": "claude",
+      "name": "tess",
+      "pane_id": "w1:p1",
+      "agent_status": "idle",
+      "cwd": "/home/dev/parser",
+      "terminal_title_stripped": "Fix the quote parser"
+    }
+  }
+}

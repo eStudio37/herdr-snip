@@ -1,0 +1,29 @@
+
+[38;2;140;140;140m✻ Running the parser tests…[0m
+
+  [38;2;110;168;222m$[0m pytest tests/test_parser.py
+  [1m============================= test session starts ==============================[0m
+  collected 12 items
+
+  tests/test_parser.py [38;2;122;196;122m........[0m[38;2;235;102;102mF[0m[38;2;122;196;122m...[0m                                        [38;2;122;196;122m[100%][0m
+
+  [38;2;235;102;102m[1m=================================== FAILURES ===================================[0m
+  [38;2;235;102;102m[1m________________________ test_parses_nested_quotes _____________________________[0m
+
+      def test_parses_nested_quotes():
+  [38;2;235;102;102m>[0m       assert parse('"a \\"b\\" c"') == ['a "b" c']
+  [38;2;235;102;102mE       AssertionError: assert ['a \\', 'b\\" c'] == ['a "b" c'][0m
+
+  [2mtests/test_parser.py:41: AssertionError[0m
+  [38;2;235;102;102m========================= [1m1 failed[0m[38;2;235;102;102m, [0m[38;2;122;196;122m11 passed[0m[38;2;235;102;102m in 0.08s =========================[0m
+
+[38;2;140;140;140m●[0m The nested-quote case fails: the tokenizer splits on the escaped quote.
+  [38;2;140;140;140mWant me to fix [1mtokenize()[0m[38;2;140;140;140m so escapes survive?[0m
+
+[48;2;55;55;55m[38;2;140;140;140m❯ [0m[48;2;55;55;55m                                                                                              [0m
+
+
+
+
+
+

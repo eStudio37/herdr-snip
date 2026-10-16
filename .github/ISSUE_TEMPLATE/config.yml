@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Herdr itself
+    url: https://github.com/herdrdev/herdr/issues
+    about: Problems with Herdr rather than this plugin belong there.

@@ -1,0 +1,27 @@
+{
+  "id": "cli:pane:layout",
+  "result": {
+    "type": "pane_layout",
+    "layout": {
+      "area": {
+        "x": 0,
+        "y": 0,
+        "width": 100,
+        "height": 30
+      },
+      "focused_pane_id": "w1:p1",
+      "panes": [
+        {
+          "pane_id": "w1:p1",
+          "focused": true,
+          "rect": {
+            "x": 0,
+            "y": 0,
+            "width": 100,
+            "height": 30
+          }
+        }
+      ]
+    }
+  }
+}
