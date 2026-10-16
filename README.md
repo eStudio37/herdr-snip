@@ -24,7 +24,7 @@ When one agent prints something another agent should look at, such as a failing 
 
 - Herdr 0.9.3 or later, with mouse capture on (the default).
 - Python 3.9 or later, available as `python3`.
-- Linux. Tested on Ubuntu 24.04 under WSL2. macOS should work and the test suite runs there in CI, but it hasn't been tried with a live Herdr yet. Native Windows Herdr is not supported.
+- Linux or macOS. Tested with a live Herdr on Ubuntu 24.04 under WSL2 and on macOS 15, and the test suite runs on both in CI. Native Windows Herdr is not supported.
 - Sound effects play on WSL and macOS. Linux sound is coming. Without a player the plugin runs silently.
 
 ## Install
