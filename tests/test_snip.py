@@ -217,6 +217,21 @@ class MacPlayerTests(unittest.TestCase):
             most = max(most, playing)
         self.assertEqual(most, 4)
 
+    def test_lingering_players_make_room(self):
+        # real afplay stays open ~0.85 s even after a 12 ms tap (seen on macOS 15)
+        self.env["STUB_SECONDS"] = "0.85"
+        self.play("freeze")
+        self.wait_for_player()
+        time.sleep(0.9)
+        start = time.time()
+        for i in range(20):                         # fast typing for one second
+            self.send("type%d" % (i % 3 + 1))
+            time.sleep(max(0.0, start + (i + 1) * 0.05 - time.time()))
+        self.send("sent")
+        started = self.started(0.4)
+        self.assertGreater(len([s for s in started if s.startswith("type")]), 5)
+        self.assertEqual(started[-1], "sent.wav")
+
     def test_quits_when_idle_and_removes_its_socket(self):
         self.play("hit", SNIP_SOUND_IDLE="0.6")
         self.wait_for_player()

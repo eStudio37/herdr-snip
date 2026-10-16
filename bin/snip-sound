@@ -283,6 +283,7 @@ def to_pcm(samples):
 AFPLAY = os.environ.get("SNIP_AFPLAY", "/usr/bin/afplay")
 AFPLAY_MAX = 4                     # afplay processes playing at once
 GAP = 0.08                         # seconds between two ticks or taps of the same kind
+LINGER = 0.25                      # an afplay this long past its sound's end may be stopped
 THROTTLED = {"move": "move", "type1": "type", "type2": "type", "type3": "type", "erase": "type"}
 
 
@@ -396,17 +397,24 @@ def serve_powershell(sock, first):
 def serve_afplay(sock, first):
     """macOS: each sound is a WAV file played by its own afplay process. Starting
     a process takes longer than the gap between fast keystrokes, so ticks and taps
-    of one kind are spaced GAP apart, and at most AFPLAY_MAX play at once."""
+    of one kind are spaced GAP apart, and at most AFPLAY_MAX play at once.
+
+    afplay stays open for most of a second even after a 12 ms tap has played, so
+    a full house of players is mostly silent. When it is full, the oldest player
+    whose sound ended more than LINGER ago is stopped to make room; otherwise fast
+    typing would also crowd out the sounds that matter, like "sent"."""
     folder = cfg.state_dir() / "sounds"
     folder.mkdir(exist_ok=True)
     level = gains()
+    length = {}
     for name, samples in sounds().items():
+        length[name] = len(samples) / RATE
         with wave.open(str(folder / (name + ".wav")), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(RATE)
             w.writeframes(to_pcm([s * level[name] for s in samples]))
-    playing, last = [], {}
+    playing, last = [], {}             # playing: (process, when its sound has ended)
     with open(cfg.state_dir() / "sound.log", "ab") as log:
         for name in requests(sock, first):
             batch, done = waiting(sock, [name])
@@ -418,14 +426,19 @@ def serve_afplay(sock, first):
                 kind = THROTTLED.get(name)
                 if kind and now - last.get(kind, -1.0) < GAP:
                     continue
-                playing = [p for p in playing if p.poll() is None]
+                playing = [(p, end) for p, end in playing if p.poll() is None]
                 if len(playing) >= AFPLAY_MAX:
-                    continue
+                    done_playing = [(p, end) for p, end in playing if end + LINGER < now]
+                    if not done_playing:
+                        continue
+                    oldest = min(done_playing, key=lambda pe: pe[1])
+                    oldest[0].terminate()
+                    playing.remove(oldest)
                 if kind:
                     last[kind] = now
                 try:
-                    playing.append(subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
-                                                    stdout=subprocess.DEVNULL, stderr=log))
+                    playing.append((subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
+                                                     stdout=subprocess.DEVNULL, stderr=log), now + length[name]))
                 except OSError:
                     return
             if done:
