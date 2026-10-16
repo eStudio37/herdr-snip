@@ -193,12 +193,16 @@ class MacPlayerTests(unittest.TestCase):
         self.play("freeze")
         self.wait_for_player()
         time.sleep(0.3)
+        start = time.time()
         for i in range(20):                         # 20 taps in one second
             self.send("type%d" % (i % 3 + 1))
-            time.sleep(0.05)
-        taps = [s for s in self.started() if s.startswith("type")]
+            time.sleep(max(0.0, start + (i + 1) * 0.05 - time.time()))
+        last_sent = time.time()
+        taps = [c for c in self.calls() if c[0] == "start" and c[2].startswith("type")]
         self.assertLessEqual(len(taps), 13)
         self.assertGreaterEqual(len(taps), 5)
+        # no backlog: the last tap sounds soon after the typing stops
+        self.assertLess(float(taps[-1][1]) - last_sent, 0.25)
 
     def test_never_more_than_four_at_once(self):
         self.env["STUB_SECONDS"] = "0.8"

@@ -409,23 +409,52 @@ def serve_afplay(sock, first):
     playing, last = [], {}
     with open(cfg.state_dir() / "sound.log", "ab") as log:
         for name in requests(sock, first):
-            path = folder / (name + ".wav")
-            if not path.exists():
-                continue
-            now = time.monotonic()
-            kind = THROTTLED.get(name)
-            if kind and now - last.get(kind, -1.0) < GAP:
-                continue
-            playing = [p for p in playing if p.poll() is None]
-            if len(playing) >= AFPLAY_MAX:
-                continue
-            if kind:
-                last[kind] = now
-            try:
-                playing.append(subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
-                                                stdout=subprocess.DEVNULL, stderr=log))
-            except OSError:
+            batch, done = waiting(sock, [name])
+            for name in batch:
+                path = folder / (name + ".wav")
+                if not path.exists():
+                    continue
+                now = time.monotonic()
+                kind = THROTTLED.get(name)
+                if kind and now - last.get(kind, -1.0) < GAP:
+                    continue
+                playing = [p for p in playing if p.poll() is None]
+                if len(playing) >= AFPLAY_MAX:
+                    continue
+                if kind:
+                    last[kind] = now
+                try:
+                    playing.append(subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
+                                                    stdout=subprocess.DEVNULL, stderr=log))
+                except OSError:
+                    return
+            if done:
                 return
+
+
+def waiting(sock, batch):
+    """Everything queued behind the request just read, so a backlog never builds:
+    starting an afplay takes about as long as the gap between fast keystrokes, and
+    taps played late trail behind the typing. Only the newest tick or tap of each
+    kind is kept. Returns (sounds to play in order, whether quit came in)."""
+    done = False
+    timeout = sock.gettimeout()
+    sock.setblocking(False)            # a socket with a timeout would wait it out
+    try:
+        while True:
+            try:
+                name = sock.recv(64).decode(errors="ignore").strip()
+            except OSError:
+                break
+            if name == "quit":
+                done = True
+                break
+            if name:
+                batch.append(name)
+    finally:
+        sock.settimeout(timeout)
+    newest = {THROTTLED[n]: i for i, n in enumerate(batch) if n in THROTTLED}
+    return [n for i, n in enumerate(batch) if n not in THROTTLED or newest[THROTTLED[n]] == i], done
 
 
 def serve(first):
