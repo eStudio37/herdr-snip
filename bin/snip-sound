@@ -401,8 +401,9 @@ def serve_afplay(sock, first):
 
     afplay stays open for most of a second even after a 12 ms tap has played, so
     a full house of players is mostly silent. When it is full, the oldest player
-    whose sound ended more than LINGER ago is stopped to make room; otherwise fast
-    typing would also crowd out the sounds that matter, like "sent"."""
+    whose sound ended more than LINGER ago is stopped to make room, and any other
+    sound may also stop the oldest tick or tap; otherwise fast typing would crowd
+    out the sounds that matter, like "sent"."""
     folder = cfg.state_dir() / "sounds"
     folder.mkdir(exist_ok=True)
     level = gains()
@@ -414,7 +415,7 @@ def serve_afplay(sock, first):
             w.setsampwidth(2)
             w.setframerate(RATE)
             w.writeframes(to_pcm([s * level[name] for s in samples]))
-    playing, last = [], {}             # playing: (process, when its sound has ended)
+    playing, last = [], {}             # playing: (process, when its sound ends, tick/tap kind)
     with open(cfg.state_dir() / "sound.log", "ab") as log:
         for name in requests(sock, first):
             batch, done = waiting(sock, [name])
@@ -426,21 +427,24 @@ def serve_afplay(sock, first):
                 kind = THROTTLED.get(name)
                 if kind and now - last.get(kind, -1.0) < GAP:
                     continue
-                playing = [(p, end) for p, end in playing if p.poll() is None]
+                playing = [entry for entry in playing if entry[0].poll() is None]
                 if len(playing) >= AFPLAY_MAX:
-                    done_playing = [(p, end) for p, end in playing if end + LINGER < now]
-                    if not done_playing:
+                    room = [e for e in playing if e[1] + LINGER < now]
+                    if not room and not kind:
+                        room = [e for e in playing if e[2]]   # a tap gives way to "sent"
+                    if not room:
                         continue
-                    oldest = min(done_playing, key=lambda pe: pe[1])
+                    oldest = min(room, key=lambda e: e[1])
                     oldest[0].terminate()
                     playing.remove(oldest)
                 if kind:
                     last[kind] = now
                 try:
-                    playing.append((subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
-                                                     stdout=subprocess.DEVNULL, stderr=log), now + length[name]))
+                    proc = subprocess.Popen([AFPLAY, str(path)], stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=log)
                 except OSError:
                     return
+                playing.append((proc, now + length[name], kind))
             if done:
                 return
 

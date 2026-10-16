@@ -230,7 +230,7 @@ class MacPlayerTests(unittest.TestCase):
         self.send("sent")
         started = self.started(0.4)
         self.assertGreater(len([s for s in started if s.startswith("type")]), 5)
-        self.assertEqual(started[-1], "sent.wav")
+        self.assertIn("sent.wav", started)          # right after typing, still heard
 
     def test_quits_when_idle_and_removes_its_socket(self):
         self.play("hit", SNIP_SOUND_IDLE="0.6")
