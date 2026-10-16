@@ -25,7 +25,7 @@ When one agent prints something another agent should look at, such as a failing 
 - Herdr 0.9.3 or later, with mouse capture on (the default).
 - Python 3.9 or later, available as `python3`.
 - Linux. Tested on Ubuntu 24.04 under WSL2. macOS should work and the test suite runs there in CI, but it hasn't been tried with a live Herdr yet. Native Windows Herdr is not supported.
-- Sound effects: WSL today, macOS in testing, Linux coming. Without a player the plugin runs silently.
+- Sound effects play on WSL and macOS. Linux sound is coming. Without a player the plugin runs silently.
 
 ## Install
 
@@ -121,7 +121,7 @@ Nothing leaves your machine except through the agent you send to. Runtime files 
 | Where | Sound |
 |---|---|
 | WSL | Plays |
-| macOS | In testing |
+| macOS | Plays |
 | Linux | Coming |
 
 On WSL, Linux audio usually isn't available, so `bin/snip-sound` synthesizes the effects in Python and hands them to one long-lived Windows PowerShell process. That process mixes them into an audio stream it keeps open, which is what lets fast typing and cursor ticks overlap without cutting each other off. Windows won't idle-sleep while an audio stream is open, so the player quits after 10 minutes without a sound.
@@ -134,7 +134,7 @@ On macOS, `bin/snip-sound` writes each effect once as a WAV file in the state fo
 - **Clicks aren't picked up.** Herdr must capture the mouse: `ui.mouse_capture` must not be set to `false` in Herdr's config.
 - **The frozen screen is offset from the live one.** Please open an issue and include `~/.local/state/herdr-snip/result.json`. Its `overlay` entry shows the sizes Snip worked from.
 - **Sending fails.** The card shows Herdr's reason. An agent waiting on an approval prompt can't receive a message until you answer it.
-- **No sound.** Sound plays on WSL, and on macOS while it is in testing. `~/.local/state/herdr-snip/sound.log` shows what the player reported.
+- **No sound.** Sound plays on WSL and macOS; Linux is coming. `~/.local/state/herdr-snip/sound.log` shows what the player reported.
 
 ## Development
 
