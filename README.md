@@ -1,4 +1,4 @@
-<h1 align="center"><img src="docs/banner.svg" alt="herdr-snip" width="600"></h1>
+<h1 align="center"><img src="docs/banner.jpg" alt="herdr-snip: three pirates argue on a beach while a fourth reads the treasure map pinned to a palm tree by a dagger"></h1>
 
 <p align="center">Freeze a <a href="https://herdr.dev">Herdr</a> pane, box part of it with two clicks, and ask any agent about it.</p>
 
