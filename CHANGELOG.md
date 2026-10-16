@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Sound effects on macOS through `afplay`, checked by ear on macOS 15. Over SSH they stay off unless the config sets `sound = on`.
+
+### Changed
+
+- On macOS the sound player listens on a socket file in the state folder, since macOS has no abstract unix sockets.
+
 ## [0.1.0] - 2026-10-15
 
 ### Added
