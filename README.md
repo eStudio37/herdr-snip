@@ -1,9 +1,11 @@
-# herdr-snip
+<h1 align="center"><img src="docs/banner.svg" alt="herdr-snip" width="600"></h1>
 
-Freeze a [Herdr](https://herdr.dev) pane, box part of it with two clicks, and ask any agent about it.
+<p align="center">Freeze a <a href="https://herdr.dev">Herdr</a> pane, box part of it with two clicks, and ask any agent about it.</p>
 
-[![CI](https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml/badge.svg)](https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml"><img src="https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
 ![Snip freezing a pane, boxing a failing test, asking a question and sending it to another agent](docs/demo.gif)
 
