@@ -8,7 +8,7 @@
 </p>
 
 ![Snip freezing a pane, boxing a failing test, asking a question and sending it to another agent](docs/demo.gif)
-
+### WATCH IT WITH SOUND.
 https://github.com/user-attachments/assets/ecf7a634-46f1-4116-bc6b-f7d34c9eb4bc
 
 When one agent prints something another agent should look at, such as a failing test, a stack trace or a diff, copying it across panes by hand is clumsy, and the receiving agent never knows where it came from. Snip freezes the screen, lets you box exactly the part you mean, and sends it with your question to the agent you pick, with a header saying whose screen it is.
