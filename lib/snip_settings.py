@@ -10,11 +10,11 @@ Settings live in Herdr's config folder for this plugin
 
 Runtime state (the frozen snapshot, the last result, the sound log, the agent
 picked last) goes to $XDG_STATE_HOME/herdr-snip, never into the plugin folder,
-which belongs to Herdr once the plugin is installed.
+which belongs to Herdr once the plugin is installed. That folder is yours alone
+(0700): the snapshot holds whatever the pane showed, secrets included.
 """
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 PLUGIN_ID = "estudio37.snip"
@@ -36,7 +36,12 @@ def run_herdr(*args, timeout=10):
 def state_dir():
     base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     path = Path(os.environ.get("SNIP_STATE_DIR") or Path(base) / "herdr-snip")
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.stat()
+    if info.st_uid != os.getuid():
+        raise PermissionError("%s belongs to another user; set SNIP_STATE_DIR to a folder of your own" % path)
+    if info.st_mode & 0o077:
+        path.chmod(0o700)
     return path
 
 
@@ -73,15 +78,14 @@ def settings():
     return values
 
 
-def sound_socket(platform=None):
-    """Where the sound player listens and the picker sends. Linux has abstract
-    unix sockets, which leave no file behind; macOS doesn't, so there it is a
-    socket file in the state folder. A SNIP_SOUND_SOCKET with a slash is a path."""
+def sound_socket():
+    """Where the sound player listens and the picker sends: a socket file in the
+    state folder, so only you can reach it. (An abstract socket, which Linux also
+    offers, has no owner: any local user could take the name and read the timing
+    of your keystrokes.) A SNIP_SOUND_SOCKET with a slash is a path."""
     name = os.environ.get("SNIP_SOUND_SOCKET", "herdr-snip-sound")
     if "/" in name:
         return name
-    if (platform or sys.platform).startswith("linux"):
-        return "\0" + name
     return str(state_dir() / (name + ".sock"))
 
 
