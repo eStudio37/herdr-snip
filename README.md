@@ -1,6 +1,6 @@
 <h1 align="center"><img src="docs/banner.jpg" alt="herdr-snip: three pirates argue on a beach while a fourth reads the treasure map pinned to a palm tree by a dagger"></h1>
 
-<p align="center">Freeze a <a href="https://herdr.dev">Herdr</a> pane, box part of it with two clicks, and ask any agent about it.</p>
+<p align="center">Box what one agent printed and hand it to another.<br>A <a href="https://herdr.dev">Herdr</a> plugin: freeze a pane, box part of it with two clicks, send it to any agent.</p>
 
 <p align="center">
   <a href="https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml"><img src="https://github.com/eStudio37/herdr-snip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -129,6 +129,17 @@ Nothing leaves your machine except through the agent you send to. Runtime files 
 On WSL, Linux audio usually isn't available, so `bin/snip-sound` synthesizes the effects in Python and hands them to one long-lived Windows PowerShell process. That process mixes them into an audio stream it keeps open, which is what lets fast typing and cursor ticks overlap without cutting each other off. Windows won't idle-sleep while an audio stream is open, so the player quits after 10 minutes without a sound.
 
 On macOS, `bin/snip-sound` writes each effect once as a WAV file in the state folder and plays it with `afplay`, which ships with macOS. Each sound starts its own `afplay`, which can't keep up with fast typing, so taps and cursor ticks of one kind are spaced at least 80 ms apart, and taps queued while one starts are collapsed into the newest so they never trail behind your typing. At most four sounds play at once. Each `afplay` stays open for most of a second even after a 12 ms tap, so a player whose sound has finished is stopped to make room, and a tap always gives way to sounds like the send jingle. Over SSH it stays quiet, because the sound would play on the Mac you connected to; set `sound = on` in the config to hear it anyway.
+
+## What Snip can access
+
+Herdr plugins run as you, with your permissions. This is everything Snip touches:
+
+- **Reads:** which pane is active (`herdr pane list`), the visible screen of the pane you freeze (`herdr pane read`), that pane's agent and position (`herdr agent get`, `pane get`, `pane layout`), and the agents in the session (`herdr agent list`). Nothing else on screen and none of your files.
+- **Sends:** one message to the agent you pick, with `herdr agent prompt`, and only when you press Send.
+- **Writes:** runtime files in `~/.local/state/herdr-snip`, listed under [How it works](#how-it-works). The frozen screen is saved there, so it holds whatever that pane showed.
+- **Runs:** `herdr`, plus the sound player: Windows PowerShell on WSL, `afplay` on macOS.
+- **Network:** none. Snip opens no network connections; the picker talks to the sound player over a local Unix socket.
+- **Dependencies:** none beyond Python's standard library.
 
 ## Troubleshooting
 

@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
 ### Added
 
 - Sound effects on macOS through `afplay`, checked by ear on macOS 15. Over SSH they stay off unless the config sets `sound = on`.
@@ -24,5 +26,6 @@ All notable changes to this project are documented here. The format follows
 - A braille hit spark on each click, and 8-bit sound effects on WSL.
 - Settings for the operator's name, sound and volume.
 
-[Unreleased]: https://github.com/eStudio37/herdr-snip/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/eStudio37/herdr-snip/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/eStudio37/herdr-snip/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/eStudio37/herdr-snip/releases/tag/v0.1.0

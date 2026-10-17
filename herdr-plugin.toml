@@ -1,8 +1,8 @@
 id = "estudio37.snip"
 name = "Snip"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.3"
-description = "Freeze a pane, box part of it with two clicks, and ask any agent about it."
+description = "Box what one agent printed and hand it to another: freeze a pane, box part of it with two clicks, send it to any agent."
 platforms = ["linux", "macos"]
 
 # Saves the active pane's screen, then opens the picker over it.
