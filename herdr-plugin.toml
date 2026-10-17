@@ -1,6 +1,6 @@
 id = "estudio37.snip"
 name = "Snip"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.9.3"
 description = "Box what one agent printed and hand it to another: freeze a pane, box part of it with two clicks, send it to any agent."
 platforms = ["linux", "macos"]

@@ -20,12 +20,13 @@ On WSL, Windows audio is reached through Windows PowerShell, since a Linux audio
 server is often missing there. On macOS each sound is written once as a WAV file
 and played by afplay, which ships with macOS (see serve_afplay). Anywhere else
 this does nothing and the plugin runs silent. Requests travel as datagrams on a
-unix socket (abstract on Linux, a file in the state folder on macOS), so senders
-never wait.
+unix socket file in the state folder, so senders never wait and only you can
+send. Anything but a known sound name is ignored.
 """
 import base64
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -321,16 +322,15 @@ def send(name):
 
 def listen():
     """Bind the player's socket, or None if a player already holds it. A socket
-    file left by a player that crashed refuses connections, so it is replaced."""
+    file left by a player that crashed refuses connections, so it is replaced;
+    anything else at that path is left alone."""
     address = cfg.sound_socket()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         sock.bind(address)
         return sock
     except OSError:
-        if address.startswith("\0"):
-            sock.close()
-            return None
+        pass
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         probe.connect(address)
@@ -341,6 +341,8 @@ def listen():
     finally:
         probe.close()
     try:
+        if not stat.S_ISSOCK(os.lstat(address).st_mode):
+            raise OSError("%s is not a socket" % address)
         os.unlink(address)
         sock.bind(address)
         return sock
@@ -349,9 +351,10 @@ def listen():
         return None
 
 
-def requests(sock, first):
-    """Sound names as they arrive, ending after IDLE quiet seconds or on quit."""
-    if first:
+def requests(sock, first, known):
+    """Sound names as they arrive, ending after IDLE quiet seconds or on quit.
+    Names not in `known` are dropped: whatever arrives here reaches a player."""
+    if first in known:
         yield first
     sock.settimeout(float(os.environ.get("SNIP_SOUND_IDLE", IDLE)))
     while True:
@@ -361,7 +364,7 @@ def requests(sock, first):
             return
         if name == "quit":
             return
-        if name:
+        if name in known:
             yield name
 
 
@@ -376,11 +379,11 @@ def serve_powershell(sock, first):
         ps = subprocess.Popen([POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
                               stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
     try:
-        level = gains()
+        level, known = gains(), set(sounds())
         for name, samples in sounds().items():
             ps.stdin.write("load %s %s\n" % (name, base64.b64encode(to_pcm([s * level[name] for s in samples])).decode()))
         ps.stdin.flush()
-        for name in requests(sock, first):
+        for name in requests(sock, first, known):
             ps.stdin.write("play %s\n" % name)
             ps.stdin.flush()
     except (BrokenPipeError, OSError):
@@ -417,8 +420,8 @@ def serve_afplay(sock, first):
             w.writeframes(to_pcm([s * level[name] for s in samples]))
     playing, last = [], {}             # playing: (process, when its sound ends, tick/tap kind)
     with open(cfg.state_dir() / "sound.log", "ab") as log:
-        for name in requests(sock, first):
-            batch, done = waiting(sock, [name])
+        for name in requests(sock, first, length):
+            batch, done = waiting(sock, [name], length)
             for name in batch:
                 path = folder / (name + ".wav")
                 if not path.exists():
@@ -449,7 +452,7 @@ def serve_afplay(sock, first):
                 return
 
 
-def waiting(sock, batch):
+def waiting(sock, batch, known):
     """Everything queued behind the request just read, so a backlog never builds:
     starting an afplay takes about as long as the gap between fast keystrokes, and
     taps played late trail behind the typing. Only the newest tick or tap of each
@@ -466,7 +469,7 @@ def waiting(sock, batch):
             if name == "quit":
                 done = True
                 break
-            if name:
+            if name in known:
                 batch.append(name)
     finally:
         sock.settimeout(timeout)
@@ -484,7 +487,7 @@ def serve(first):
         (serve_powershell if kind == "powershell" else serve_afplay)(sock, first)
     finally:
         sock.close()
-        if isinstance(address, str) and address and not address.startswith("\0"):
+        if isinstance(address, str) and address:
             try:
                 os.unlink(address)
             except OSError:
