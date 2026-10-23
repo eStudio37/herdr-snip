@@ -32,8 +32,10 @@ When one agent prints something another agent should look at, such as a failing 
 ## Install
 
 ```sh
-herdr plugin install eStudio37/herdr-snip
+herdr plugin install eStudio37/herdr-snip --ref v0.2.1
 ```
+
+`--ref` installs that exact release. Without it you get whatever is on `main` at that moment. Plugins run with your permissions and no sandbox, so pin a release you can read first, and update by changing the tag.
 
 Then bind a key in `~/.config/herdr/config.toml`:
 
