@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- CI actions are pinned to commit SHAs (checkout v7.0.1, setup-python v7.0.0), and checkout keeps no credentials.
+- The install command pins a release with `--ref`, so a change to `main` never reaches a new install by itself.
+
 ## [0.2.1] - 2026-10-17
 
 ### Security
